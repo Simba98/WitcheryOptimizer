@@ -1,6 +1,6 @@
 # Witchery Optimizer
 
-Witchery Optimizer replaces Witchery 0.24.1's permanently chunk-loaded Poppet Shelves and global loaded-TileEntity scans with a UUID-indexed, world-persistent cache. It targets GT New Horizons 2.8.4 on Minecraft 1.7.10.
+Witchery Optimizer is a **server-side-only** mod that replaces Witchery 0.24.1's permanently chunk-loaded Poppet Shelves and global loaded-TileEntity scans with a UUID-indexed, world-persistent cache. It targets GT New Horizons 2.8.4 on Minecraft 1.7.10. Install it only on the dedicated server; clients do not need the mod and may connect without it.
 
 ## Behavior
 

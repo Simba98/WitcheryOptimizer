@@ -13,6 +13,7 @@
 		"logoFile": "",
 		"screenshots": [],
 		"parent": "",
+		"serverSideOnly": true,
 		"requiredMods": ["witchery"],
 		"dependencies": [],
 		"dependants": [],

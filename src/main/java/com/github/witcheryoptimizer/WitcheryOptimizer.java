@@ -17,6 +17,7 @@ import cpw.mods.fml.common.event.FMLServerStoppedEvent;
     name = "Witchery Optimizer",
     version = Tags.VERSION,
     dependencies = "required-after:witchery@[0.24.1,0.25)",
+    acceptableRemoteVersions = "*",
     acceptedMinecraftVersions = "[1.7.10]")
 public final class WitcheryOptimizer {
 
