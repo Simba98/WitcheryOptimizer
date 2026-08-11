@@ -1,0 +1,62 @@
+name: CD
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: true
+
+      - name: Download Witchery 0.24.1
+        shell: bash
+        run: |
+          mkdir -p libs
+          curl --fail --location --retry 3 \
+            https://mediafilez.forgecdn.net/files/2234/410/witchery-1.7.10-0.24.1.jar \
+            --output libs/witchery-1.7.10-0.24.1.jar
+          echo "22096b8e462fa5cca3a6c8054116d4fc  libs/witchery-1.7.10-0.24.1.jar" | md5sum --check --strict
+
+      - name: Build
+        run: ./gradlew build --no-daemon
+
+      - name: Stage release artifacts
+        shell: bash
+        run: |
+          mkdir release
+          cp "$(find build/libs -maxdepth 1 -type f -name '*.jar' ! -name '*-dev.jar' ! -name '*-sources.jar' -print -quit)" \
+            "release/WitcheryOptimizer-${GITHUB_REF_NAME}.jar"
+          cp "$(find build/libs -maxdepth 1 -type f -name '*-sources.jar' -print -quit)" \
+            "release/WitcheryOptimizer-${GITHUB_REF_NAME}-sources.jar"
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release/* --generate-notes --verify-tag
+
+      - name: Upload manually dispatched artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: witcheryoptimizer-release
+          path: release/*
+          if-no-files-found: error

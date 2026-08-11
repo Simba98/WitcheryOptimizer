@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: true
+
+      - name: Download Witchery 0.24.1
+        shell: bash
+        run: |
+          mkdir -p libs
+          curl --fail --location --retry 3 \
+            https://mediafilez.forgecdn.net/files/2234/410/witchery-1.7.10-0.24.1.jar \
+            --output libs/witchery-1.7.10-0.24.1.jar
+          echo "22096b8e462fa5cca3a6c8054116d4fc  libs/witchery-1.7.10-0.24.1.jar" | md5sum --check --strict
+
+      - name: Build
+        run: ./gradlew build --no-daemon
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: witcheryoptimizer-${{ github.sha }}
+          path: |
+            build/libs/*.jar
+            !build/libs/*-dev.jar
+          if-no-files-found: error
+          retention-days: 14
