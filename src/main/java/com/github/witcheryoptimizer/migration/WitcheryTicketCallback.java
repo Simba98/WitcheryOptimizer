@@ -26,16 +26,30 @@ public final class WitcheryTicketCallback implements OrderedLoadingCallback {
 
     @Override
     public void ticketsLoaded(List<Ticket> tickets, World world) {
-        int successes = 0;
-        for (Ticket ticket : tickets) {
-            if (PoppetRegistry.instance()
-                .importWitcheryTicket(ticket, world)) {
-                ForgeChunkManager.releaseTicket(ticket);
-                successes++;
+        PoppetRegistry registry = PoppetRegistry.instance();
+        TicketBatch.process(tickets, new TicketBatch.Actions<Ticket>() {
+
+            @Override
+            public boolean importTicket(Ticket ticket) {
+                return registry.importWitcheryTicket(ticket, world);
             }
-        }
-        PoppetRegistry.instance()
-            .finishWitcheryTickets(world.provider.dimensionId, successes, tickets.size());
+
+            @Override
+            public void release(Ticket ticket) {
+                ForgeChunkManager.releaseTicket(ticket);
+            }
+
+            @Override
+            public void finish(int successes, int offered) {
+                registry.finishWitcheryTickets(world.provider.dimensionId, successes, offered);
+            }
+
+            @Override
+            public void failure(Ticket ticket, Throwable failure) {
+                WitcheryOptimizer.LOG
+                    .error("Witchery ticket import failed; continuing retained-ticket cleanup", failure);
+            }
+        });
     }
 
     public static void register(Object witchery) {

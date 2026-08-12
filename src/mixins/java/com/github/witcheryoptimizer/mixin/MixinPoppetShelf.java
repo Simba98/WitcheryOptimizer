@@ -34,6 +34,9 @@ public abstract class MixinPoppetShelf implements PoppetShelfState {
     @Unique
     private boolean witcheryoptimizer$persistentShelfId;
 
+    @Unique
+    private long witcheryoptimizer$diskMirrorVersion = -1;
+
     @Override
     public UUID witcheryoptimizer$getShelfId() {
         return witcheryoptimizer$shelfId;
@@ -52,6 +55,16 @@ public abstract class MixinPoppetShelf implements PoppetShelfState {
     @Override
     public void witcheryoptimizer$setPersistentShelfId(boolean persistent) {
         witcheryoptimizer$persistentShelfId = persistent;
+    }
+
+    @Override
+    public long witcheryoptimizer$getDiskMirrorVersion() {
+        return witcheryoptimizer$diskMirrorVersion;
+    }
+
+    @Override
+    public void witcheryoptimizer$setDiskMirrorVersion(long version) {
+        witcheryoptimizer$diskMirrorVersion = version;
     }
 
     @Override
@@ -91,6 +104,7 @@ public abstract class MixinPoppetShelf implements PoppetShelfState {
 
     @Inject(method = "readFromNBT", at = @At("RETURN"), remap = true)
     private void witcheryoptimizer$readId(NBTTagCompound tag, CallbackInfo ci) {
+        witcheryoptimizer$diskMirrorVersion = tag.hasKey("WOWritebackVersion") ? tag.getLong("WOWritebackVersion") : -1;
         if (tag.hasKey("WOShelfUuidMost") && tag.hasKey("WOShelfUuidLeast")) {
             witcheryoptimizer$shelfId = new UUID(tag.getLong("WOShelfUuidMost"), tag.getLong("WOShelfUuidLeast"));
             witcheryoptimizer$persistentShelfId = true;

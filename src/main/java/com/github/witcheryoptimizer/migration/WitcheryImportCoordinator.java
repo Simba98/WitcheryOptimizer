@@ -12,7 +12,7 @@ public final class WitcheryImportCoordinator {
     private boolean finalized;
 
     public boolean inspect(int dimension, boolean[] plausible, int maximum) {
-        if (failed) return false;
+        if (failed || finalized || outstanding.containsKey(dimension)) return false;
         boolean valid = plausible.length <= maximum;
         for (boolean value : plausible) if (!value) valid = false;
         if (!valid) {
@@ -44,14 +44,16 @@ public final class WitcheryImportCoordinator {
         failed = true;
     }
 
-    public void reset() {
+    public void resetForServerStop() {
         outstanding.clear();
         failed = false;
         finalized = false;
     }
 
     public void resume(PoppetWorldData.ImportState persisted) {
-        reset();
+        if (!outstanding.isEmpty()) throw new IllegalStateException("Cannot recover import state after inspection");
+        failed = false;
+        finalized = false;
         if (persisted == PoppetWorldData.ImportState.IN_PROGRESS || persisted == PoppetWorldData.ImportState.FAILED)
             failed = true;
         else if (persisted == PoppetWorldData.ImportState.COMPLETE) finalized = true;

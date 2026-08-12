@@ -33,6 +33,12 @@ final class ShelfJournal {
                 .getWorldDirectory());
     }
 
+    private static void validateSchema(NBTTagCompound value) throws IOException {
+        if (value == null) return;
+        if (!value.hasKey("Schema", 3) || value.getInteger("Schema") != PoppetWorldData.SCHEMA)
+            throw new IOException("Unsupported optimizer journal: required integer Schema=" + PoppetWorldData.SCHEMA);
+    }
+
     ShelfJournal(File directory) throws IOException {
         this.directory = directory;
         file = new File(directory, FILE_NAME);
@@ -40,17 +46,36 @@ final class ShelfJournal {
         root = loadNewest();
     }
 
-    void recover(PoppetWorldData data) {
+    void recover(PoppetWorldData data) throws IOException {
         NBTTagList operations = root.getTagList("Entries", 10);
         for (int i = 0; i < operations.tagCount(); i++) data.applyJournal(operations.getCompoundTagAt(i));
         if (operations.tagCount() > 0) data.markDirty();
-        if (root.hasKey("ImportState"))
+        if (root.hasKey("ImportState")) try {
             data.setImportState(PoppetWorldData.ImportState.valueOf(root.getString("ImportState")));
+        } catch (IllegalArgumentException exception) {
+            throw new IOException("Invalid journal ImportState=" + root.getString("ImportState"), exception);
+        }
+        if (root.hasKey("CensusState")) try {
+            data.setCensusState(
+                root.getInteger("CensusVersion"),
+                PoppetWorldData.CensusState.valueOf(root.getString("CensusState")));
+        } catch (IllegalArgumentException exception) {
+            throw new IOException("Invalid journal CensusState=" + root.getString("CensusState"), exception);
+        }
     }
 
     void appendImportState(PoppetWorldData.ImportState state) throws IOException {
         NBTTagCompound next = (NBTTagCompound) root.copy();
         next.setString("ImportState", state.name());
+        next.setLong("Sequence", root.getLong("Sequence") + 1);
+        writeAndReplace(next, temporary, file);
+        root = next;
+    }
+
+    void appendCensusState(int version, PoppetWorldData.CensusState state) throws IOException {
+        NBTTagCompound next = (NBTTagCompound) root.copy();
+        next.setInteger("CensusVersion", version);
+        next.setString("CensusState", state.name());
         next.setLong("Sequence", root.getLong("Sequence") + 1);
         writeAndReplace(next, temporary, file);
         root = next;
@@ -69,6 +94,10 @@ final class ShelfJournal {
         putUuid(operation, "Shelf", record.id);
         operation.setLong("Generation", generation);
         operation.setTag("Location", record.location.write());
+        if (record.removalTransaction != null) {
+            operation.setLong("RemovalMost", record.removalTransaction.getMostSignificantBits());
+            operation.setLong("RemovalLeast", record.removalTransaction.getLeastSignificantBits());
+        }
         replaceEntry(record.id, operation);
     }
 
@@ -76,10 +105,15 @@ final class ShelfJournal {
         Map<UUID, NBTTagCompound> compacted = entries((NBTTagCompound) root.copy());
         compacted.put(shelf, (NBTTagCompound) operation.copy());
         NBTTagCompound next = new NBTTagCompound();
+        next.setInteger("Schema", PoppetWorldData.SCHEMA);
         NBTTagList list = new NBTTagList();
         for (NBTTagCompound entry : compacted.values()) list.appendTag(entry);
         next.setTag("Entries", list);
         if (root.hasKey("ImportState")) next.setString("ImportState", root.getString("ImportState"));
+        if (root.hasKey("CensusState")) {
+            next.setInteger("CensusVersion", root.getInteger("CensusVersion"));
+            next.setString("CensusState", root.getString("CensusState"));
+        }
         next.setLong("Sequence", root.getLong("Sequence") + 1);
         writeAndReplace(next, temporary, file);
         root = next;
@@ -107,8 +141,12 @@ final class ShelfJournal {
         NBTTagCompound temp = validRead(temporary);
         if (main == null && temp == null) {
             if (file.exists() || temporary.exists()) throw new IOException("No valid optimizer journal copy exists");
-            return new NBTTagCompound();
+            NBTTagCompound fresh = new NBTTagCompound();
+            fresh.setInteger("Schema", PoppetWorldData.SCHEMA);
+            return fresh;
         }
+        validateSchema(main);
+        validateSchema(temp);
         if (temp != null && (main == null || temp.getLong("Sequence") > main.getLong("Sequence"))) {
             replace(temporary.toPath(), file.toPath());
             forceDirectory();

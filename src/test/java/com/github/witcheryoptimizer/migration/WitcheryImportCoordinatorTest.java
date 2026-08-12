@@ -57,4 +57,19 @@ public class WitcheryImportCoordinatorTest {
         assertEquals(PoppetWorldData.ImportState.COMPLETE, complete.state());
         assertFalse(complete.finalizeStartup());
     }
+
+    @Test
+    public void inspectionCannotBeResetOrRecoveredMidCallback() {
+        WitcheryImportCoordinator c = new WitcheryImportCoordinator();
+        assertTrue(c.inspect(0, new boolean[] { true }, 1));
+        try {
+            c.resume(PoppetWorldData.ImportState.UNKNOWN);
+            fail("resume must not clear an outstanding callback");
+        } catch (IllegalStateException expected) {}
+        assertFalse(c.finalizeStartup());
+        c.finish(0, 1, 1);
+        assertTrue(c.inspect(1, new boolean[] { true, true }, 2));
+        c.finish(1, 2, 2);
+        assertTrue(c.finalizeStartup());
+    }
 }

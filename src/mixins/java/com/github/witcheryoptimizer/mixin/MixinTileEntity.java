@@ -12,7 +12,8 @@ import com.github.witcheryoptimizer.registry.PoppetShelfState;
 @Mixin(TileEntity.class)
 public abstract class MixinTileEntity {
 
-    @Inject(method = "onChunkUnload", at = @At("HEAD"), remap = false)
+    // Forge adds this unobfuscated method after MCP remapping. It has no SRG mapping; remap=true is invalid.
+    @Inject(method = "onChunkUnload()V", at = @At("HEAD"), remap = false)
     private void witcheryoptimizer$onChunkUnload(CallbackInfo ci) {
         if ((Object) this instanceof PoppetShelfState) {
             ((PoppetShelfState) (Object) this).witcheryoptimizer$detach();

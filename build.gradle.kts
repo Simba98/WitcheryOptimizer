@@ -7,7 +7,7 @@ plugins {
     id("com.gtnewhorizons.gtnhconvention")
 }
 
-version = "0.2.0"
+version = "0.2.1"
 
 val validateProductionJar by tasks.registering {
     group = "verification"
@@ -30,6 +30,10 @@ val validateProductionJar by tasks.registering {
             Regex("\"(?:mixins|server)\"\\s*:\\s*\\[([^]]*)]", RegexOption.DOT_MATCHES_ALL).findAll(json)
                 .flatMap { Regex("\"([^\"]+)\"").findAll(it.groupValues[1]).map { match -> match.groupValues[1] } }
                 .forEach { check(zip.getEntry(packageName.replace('.', '/') + "/" + it + ".class") != null) { "Missing mixin class $it" } }
+            val tileMixin = zip.getInputStream(zip.getEntry(packageName.replace('.', '/') + "/MixinTileEntity.class")).readBytes()
+            check(tileMixin.toString(Charsets.ISO_8859_1).contains("onChunkUnload()V")) {
+                "Production MixinTileEntity lost the Forge-added, unobfuscated onChunkUnload()V target"
+            }
         }
     }
 }

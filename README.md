@@ -1,37 +1,34 @@
 # Witchery Optimizer
 
-Witchery Optimizer is a **server-side-only** mod that replaces Witchery 0.24.1's permanently chunk-loaded Poppet Shelves and loaded-TileEntity scans with an authoritative UUID-indexed `WorldSavedData` inventory. It targets GT New Horizons 2.8.4 on Minecraft 1.7.10. Clients do not need the mod.
+Witchery Optimizer 0.2.1 is a **server-side-only** mod for Witchery 0.24.1 on Minecraft 1.7.10. It replaces permanent Poppet Shelf chunk tickets with authoritative, UUID-indexed `WorldSavedData`; clients do not need the mod.
 
-## Behavior
+## Safety and compatibility
 
-- Stores every shelf's complete nine-slot `ItemStack` inventory, custom name, location, stable order and persistent UUID.
-- Searches `MinecraftServer.worldServers` in its original order, then shelves in stable creation order, without loading chunks.
-- Uses Witchery's private inventory matcher through a Mixin invoker, preserving exact taglock, second-tag, damage, destruction and returned-stack behavior. Successful lookup is consumed and persisted immediately on the server thread.
-- Suppresses new permanent tickets. On first installation over plain Witchery, restored Witchery shelf tickets load and import otherwise-unloaded shelf TEs before their tickets are released; every loaded shelf TE is also imported on attachment.
-- Persists restart-safe plain-Witchery import state. A malformed ticket or a ticket that does not resolve to a shelf fails closed and disables optimized shelf lookup rather than risking item loss. Upgrading from WitcheryOptimizer v0.1 is intentionally unsupported.
-- Writes idempotent post-state/removal operations to an fsynced, atomically replaced journal in the world directory before returning protection success or allowing shelf drops. Tombstones prevent stale chunk NBT from resurrecting broken identities.
-- Keeps loaded tile entities synchronized and serializes the UUID plus authoritative contents into chunk/mover NBT.
+- Stores complete nine-slot inventories, custom names, locations, stable observed order, versions and shelf UUIDs.
+- Runs a read-only startup census over every registered dimension's region folder using Minecraft `RegionFile`/NBT APIs. It closes every stream, never requests chunks, never writes region files, and fails closed on any unreadable/corrupt chunk.
+- Ticket restoration is only an additional import source. Accepted phase-two tickets are always released once in `finally`; rejected phase-one tickets are omitted. Import must persist `UNKNOWN -> IN_PROGRESS -> COMPLETE`; interrupted or failed work stays `FAILED`.
+- Lookup preserves Witchery parity: player inventory and hunter-clothes behavior remain original; loaded shelves are traversed in each `DimensionManager.getWorlds()` world's live `loadedTileEntityList` order and use Witchery's private matcher. Unloaded records use persisted dimension/observation order.
+- Dimension restriction keeps Witchery's numeric allowance: Overworld (0), Nether (-1), End (1), and configured Dream dimension. No personal dimension IDs are hardcoded.
+- Generic NBT movers are deliberately unsupported. A UUID copied to another location is quarantined and its carried inventory is **not imported**; the authoritative source remains usable. Intentional player placement receives a new identity. This fail-closed policy avoids guessing move versus clone and guarantees no copied authoritative inventory.
+- Removal WAL-persists a transaction UUID and full inventory before block mutation, then WAL-persists `RemovalDropsStarted` before Witchery's first loose drop is spawned. Every shelf-break `EntityItem` retains Witchery's original split/NBT/motion and receives the transaction UUID plus a deterministic ordinal in persistent Forge entity data. Startup census reads both tile and entity NBT: an untouched exact shelf with no started drops is restored; complete tagged drops terminally tombstone the shelf (including shelf-plus-drops); missing/incomplete evidence fails census and lookup closed. Reconciliation is replay-idempotent and census cannot complete while any prepared removal remains.
+- Loaded shelves always serialize ordinary Witchery `Items`/`CustomName` NBT plus UUID. Unloaded consumption marks durable pending writeback; natural chunk load mirrors authoritative state and marks the chunk dirty; serialization embeds `WOWritebackVersion`, but pending clears only after a later natural region reload proves that exact authoritative version reached disk. Startup/shutdown logs report the exact pending count. Stale physical NBT cannot become authoritative while installed.
 
-For safety, an arriving shelf UUID at a different persisted location is treated as a clone and receives a new identity, even if the original chunk is unloaded; its self-contained TE inventory is imported instead of hijacking the original record. Automatic TE movement is unsupported in v0.2.0. A mover serializing the shelf at a different coordinate creates a fresh UUID and imports its carried inventory; the original authoritative identity is never relocated. Coordinate-only movers are likewise treated as break/new shelf.
+Clean uninstall is safe only when logs show no pending writeback and logs report zero pending writebacks after every changed shelf-owning chunk has saved, unloaded, and naturally reloaded to confirm the disk version. Keep a backup; uninstalling while pending mirrors exist can expose stale Witchery NBT.
 
-When Witchery's restriction is enabled, allowed dimensions are resolved once from the actual server-world array: exact vanilla provider classes plus the configured Dream dimension. Subclassed replacement providers fail closed rather than broadening Witchery's intended set. No numeric vanilla dimension IDs are present in optimizer lookup code.
+Schema validation is strict. Missing schema, Schema 1, and schema-1 journal data produce an explicit unsupported-v0.1 startup failure and are never migrated, reset, or overwritten. A pure Witchery world with no optimizer data remains supported.
 
-Minecraft override injections use MCP names with `remap=true`. Witchery-owned custom methods, fields and the private matcher have no MCP mappings and therefore necessarily use `remap=false`; forcing remapping would produce invalid runtime targets.
+`TileEntity.onChunkUnload()V` is Forge-added and remains unobfuscated in production: the mixin target intentionally has `remap=false`. It has no SRG mapping; `remap=true` is invalid and rejected by the annotation processor. The required mixin configuration remains safe because the explicit descriptor is validated in the production artifact.
 
 ## Building
 
-1. Obtain the original `witchery-1.7.10-0.24.1.jar` and place it in `libs/`.
-2. Use JDK 25 to run the current GTNH Gradle convention plugin.
-3. Run `./gradlew build` or `gradlew.bat build`. `check` also opens the exact reobfuscated production JAR and verifies its manifest, mixin JSON, refmap and listed classes.
+Place `witchery-1.7.10-0.24.1.jar` in `libs/`, use the project JDK 25, and run:
 
-The wrapper sets `GRADLE_USER_HOME` to `.gradle-user-home` inside the project unless it is already set, so builds do not create caches in the user's home directory. The resulting Java classes target Java 8.
+```text
+gradlew.bat spotlessCheck check build validateProductionJar
+```
 
-The Witchery dependency is used only for local development and is excluded from source control and produced artifacts.
+The wrapper uses the repository-local `.gradle-user-home`. `validateProductionJar` checks the reobfuscated JAR manifest, mixin config/refmap/classes and the exact unobfuscated `onChunkUnload()V` target.
 
 ## License
 
-Witchery Optimizer is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
-
-Plain-Witchery ticket import is fail-closed and persisted. If a corrupt or unresolved restored ticket marks import FAILED, repair or remove the corrupt Forge ticket data and reset the world's WitcheryImportState to UNKNOWN before restarting; optimizer shelf lookup remains disabled meanwhile.
-
-Stale shelf NBT carrying a tombstoned UUID, or lacking an identity at a tombstoned location, is quarantined. Only a real server-side Forge player placement event authorizes one fresh identity at that coordinate.
+GNU GPL v3.0. See [LICENSE](LICENSE).

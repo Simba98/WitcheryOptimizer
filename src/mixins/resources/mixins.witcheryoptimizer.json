@@ -8,6 +8,7 @@
   "mixins": [
     "ItemPoppetInvoker",
     "MixinBlockPoppetShelf",
+    "MixinEntityItem",
     "MixinItemPoppet",
     "MixinPoppetShelf",
     "MixinTileEntity",

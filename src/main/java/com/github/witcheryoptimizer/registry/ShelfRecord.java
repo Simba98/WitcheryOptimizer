@@ -8,12 +8,23 @@ import net.minecraft.nbt.NBTTagList;
 
 final class ShelfRecord {
 
+    enum State {
+        ACTIVE,
+        REMOVAL_PREPARED,
+        REMOVAL_CLEANUP_PENDING
+    }
+
     final UUID id;
     final long order;
     final ItemStack[] inventory = new ItemStack[9];
     long version;
     ShelfLocation location;
     String customName;
+    State state = State.ACTIVE;
+    boolean writebackPending;
+    UUID removalTransaction;
+    boolean removalDropsStarted;
+    long removalSourceVersion;
 
     ShelfRecord(UUID id, ShelfLocation location, String customName, long order, ItemStack[] source) {
         this.id = id;
@@ -33,6 +44,14 @@ final class ShelfRecord {
         tag.setLong("UuidLeast", id.getLeastSignificantBits());
         tag.setLong("Order", order);
         tag.setLong("Version", version);
+        tag.setString("State", state.name());
+        tag.setBoolean("WritebackPending", writebackPending);
+        if (removalTransaction != null) {
+            tag.setLong("RemovalTransactionMost", removalTransaction.getMostSignificantBits());
+            tag.setLong("RemovalTransactionLeast", removalTransaction.getLeastSignificantBits());
+            tag.setBoolean("RemovalDropsStarted", removalDropsStarted);
+            tag.setLong("RemovalSourceVersion", removalSourceVersion);
+        }
         tag.setTag("Location", location.write());
         if (!customName.isEmpty()) tag.setString("CustomName", customName);
         NBTTagList items = new NBTTagList();
@@ -62,6 +81,24 @@ final class ShelfRecord {
             tag.getLong("Order"),
             inventory);
         record.version = tag.getLong("Version");
+        if (tag.hasKey("State")) {
+            try {
+                record.state = State.valueOf(tag.getString("State"));
+            } catch (IllegalArgumentException exception) {
+                throw new IllegalStateException(
+                    "Invalid shelf transaction state: " + tag.getString("State"),
+                    exception);
+            }
+        }
+        record.writebackPending = tag.getBoolean("WritebackPending");
+        if (tag.hasKey("RemovalTransactionMost") && tag.hasKey("RemovalTransactionLeast"))
+            record.removalTransaction = new UUID(
+                tag.getLong("RemovalTransactionMost"),
+                tag.getLong("RemovalTransactionLeast"));
+        record.removalDropsStarted = tag.getBoolean("RemovalDropsStarted");
+        record.removalSourceVersion = tag.getLong("RemovalSourceVersion");
+        if (record.state != State.ACTIVE && record.removalTransaction == null)
+            throw new IllegalStateException("Prepared shelf removal has no transaction identity");
         return record;
     }
 

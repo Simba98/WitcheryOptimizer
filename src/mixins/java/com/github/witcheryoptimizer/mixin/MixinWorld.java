@@ -18,11 +18,11 @@ public abstract class MixinWorld {
     private void witcheryoptimizer$preRemove(int x, int y, int z, Block replacement, int metadata, int flags,
         CallbackInfoReturnable<Boolean> cir) {
         World world = (World) (Object) this;
+        PoppetRegistry registry = PoppetRegistry.instance();
         if (!world.isRemote && world.getBlock(x, y, z) == Witchery.Blocks.POPPET_SHELF
             && replacement != Witchery.Blocks.POPPET_SHELF
-            && !PoppetRegistry.instance()
-                .preRemove(world, x, y, z))
-            cir.setReturnValue(false);
+            && !registry.isAuthorizedCleanupRemoval(world, x, y, z)
+            && !registry.preRemove(world, x, y, z)) cir.setReturnValue(false);
     }
 
     @Inject(method = "setBlock(IIILnet/minecraft/block/Block;II)Z", at = @At("RETURN"), remap = true)
