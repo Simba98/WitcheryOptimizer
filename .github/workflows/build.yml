@@ -40,6 +40,9 @@ jobs:
       - name: Build
         run: ./gradlew build --no-daemon
 
+      - name: Validate production artifact
+        run: ./gradlew validateProductionJar --no-daemon
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:

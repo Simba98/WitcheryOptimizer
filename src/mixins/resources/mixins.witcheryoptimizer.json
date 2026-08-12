@@ -1,0 +1,19 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "com.github.witcheryoptimizer.mixin",
+  "refmap": "mixins.witcheryoptimizer.refmap.json",
+  "target": "@env(DEFAULT)",
+  "compatibilityLevel": "JAVA_8",
+  "mixins": [
+    "ItemPoppetInvoker",
+    "MixinBlockPoppetShelf",
+    "MixinItemPoppet",
+    "MixinPoppetShelf",
+    "MixinTileEntity",
+    "MixinWitchery",
+    "MixinWorld"
+  ],
+  "client": [],
+  "server": []
+}

@@ -3,7 +3,7 @@
 	"modList": [{
 		"modid": "${modId}",
 		"name": "${modName}",
-		"description": "UUID-indexed, world-persistent poppet shelf cache for Witchery 0.24.1.",
+		"description": "Authoritative UUID-indexed poppet shelf storage for Witchery 0.24.1.",
 		"version": "${modVersion}",
 		"mcversion": "${minecraftVersion}",
 		"url": "https://github.com/Simba98/WitcheryOptimizer",

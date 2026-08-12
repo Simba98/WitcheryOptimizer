@@ -35,4 +35,5 @@
  */
 dependencies {
     devOnlyNonPublishable(rfg.deobf(project.files("libs/witchery-1.7.10-0.24.1.jar")))
+    testImplementation("junit:junit:4.13.2")
 }
