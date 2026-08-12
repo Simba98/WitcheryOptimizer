@@ -117,6 +117,46 @@ public class ShelfJournalTest {
         }
     }
 
+    @Test
+    public void retryMetadataSurvivesCompaction() throws Exception {
+        File directory = Files.createTempDirectory("wo-retry-")
+            .toFile();
+        try {
+            ShelfJournal journal = new ShelfJournal(directory);
+            journal.appendCensusRetry(1, 3, 123456L, true, "corrupt nbt");
+            journal.appendPost(record(1));
+            PoppetWorldData data = new PoppetWorldData();
+            new ShelfJournal(directory).recover(data);
+            assertEquals(PoppetWorldData.CensusState.RETRY_WAIT, data.censusState());
+            assertEquals(3, data.retryAttempt());
+            assertEquals(123456L, data.retryAt(100000L));
+        } finally {
+            delete(directory);
+        }
+    }
+
+    @Test
+    public void failedCompleteAppendLeavesRunningDurably() throws Exception {
+        File directory = Files.createTempDirectory("wo-complete-fail-")
+            .toFile();
+        try {
+            ShelfJournal journal = new ShelfJournal(directory);
+            journal.appendCensusState(1, PoppetWorldData.CensusState.IN_PROGRESS);
+            File temp = new File(directory, "witcheryoptimizer-journal.dat.tmp");
+            assertTrue(temp.mkdir());
+            try {
+                journal.appendCensusState(1, PoppetWorldData.CensusState.COMPLETE);
+                fail("append should fail");
+            } catch (java.io.IOException expected) {}
+            assertTrue(temp.delete());
+            PoppetWorldData data = new PoppetWorldData();
+            new ShelfJournal(directory).recover(data);
+            assertEquals(PoppetWorldData.CensusState.IN_PROGRESS, data.censusState());
+        } finally {
+            delete(directory);
+        }
+    }
+
     private static ShelfRecord record(long version) {
         ShelfRecord record = new ShelfRecord(UUID.randomUUID(), new ShelfLocation(7, 1, 2, 3), "", 0, new ItemStack[9]);
         record.version = version;

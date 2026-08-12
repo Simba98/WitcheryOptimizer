@@ -26,6 +26,10 @@ public final class PoppetWorldData extends WorldSavedData {
     private ImportState importState = ImportState.UNKNOWN;
     private CensusState censusState = CensusState.UNKNOWN;
     private int censusVersion;
+    private int retryAttempt;
+    private long retryAt;
+    private boolean retryCorruption;
+    private String retryReason = "";
 
     public PoppetWorldData() {
         super(NAME);
@@ -71,6 +75,12 @@ public final class PoppetWorldData extends WorldSavedData {
         censusVersion = root.getInteger("CensusVersion");
         censusState = root.hasKey("CensusState") ? requiredState(root, "CensusState", CensusState.class)
             : CensusState.UNKNOWN;
+        retryAttempt = Math.max(0, root.getInteger("CensusRetryAttempt"));
+        retryAt = root.getLong("CensusRetryAt");
+        retryCorruption = root.getBoolean("CensusRetryCorruption");
+        retryReason = root.getString("CensusRetryReason");
+        if (censusState == CensusState.IN_PROGRESS || censusState == CensusState.FAILED)
+            censusState = CensusState.RETRY_WAIT;
     }
 
     @Override
@@ -80,6 +90,10 @@ public final class PoppetWorldData extends WorldSavedData {
         root.setString("WitcheryImportState", importState.name());
         root.setInteger("CensusVersion", censusVersion);
         root.setString("CensusState", censusState.name());
+        root.setInteger("CensusRetryAttempt", retryAttempt);
+        root.setLong("CensusRetryAt", retryAt);
+        root.setBoolean("CensusRetryCorruption", retryCorruption);
+        root.setString("CensusRetryReason", retryReason);
         NBTTagList list = new NBTTagList();
         for (ShelfRecord record : shelves.values()) list.appendTag(record.write());
         root.setTag("Shelves", list);
@@ -237,7 +251,43 @@ public final class PoppetWorldData extends WorldSavedData {
     void setCensusState(int version, CensusState state) {
         censusVersion = version;
         censusState = state;
+        if (state == CensusState.COMPLETE) {
+            retryAttempt = 0;
+            retryAt = 0;
+            retryCorruption = false;
+            retryReason = "";
+        }
         markDirty();
+    }
+
+    void setCensusRetry(int version, int attempt, long at, boolean corruption, String reason) {
+        censusVersion = version;
+        censusState = CensusState.RETRY_WAIT;
+        retryAttempt = Math.max(1, attempt);
+        retryAt = at;
+        retryCorruption = corruption;
+        retryReason = reason == null ? "" : reason.substring(0, Math.min(160, reason.length()));
+        markDirty();
+    }
+
+    int retryAttempt() {
+        return retryAttempt;
+    }
+
+    long retryAt(long now) {
+        return RetryPolicy.clampDeadline(now, retryAt, retryCorruption);
+    }
+
+    boolean retryDue(long now) {
+        return RetryPolicy.due(now, retryAt, retryCorruption);
+    }
+
+    boolean retryCorruption() {
+        return retryCorruption;
+    }
+
+    String retryReason() {
+        return retryReason;
     }
 
     int pendingWritebacks() {
@@ -265,14 +315,17 @@ public final class PoppetWorldData extends WorldSavedData {
         UNKNOWN,
         IN_PROGRESS,
         COMPLETE,
-        FAILED
+        FAILED,
+        DRAINED_CLEAN,
+        DRAINED_WITH_GAPS
     }
 
     public enum CensusState {
         UNKNOWN,
         IN_PROGRESS,
         COMPLETE,
-        FAILED
+        FAILED,
+        RETRY_WAIT
     }
 
     private static <E extends Enum<E>> E requiredState(NBTTagCompound root, String key, Class<E> type) {

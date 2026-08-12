@@ -12,16 +12,17 @@ public class WitcheryImportCoordinatorTest {
     public void ticketFreeStartupCompletes() {
         WitcheryImportCoordinator c = new WitcheryImportCoordinator();
         assertTrue(c.finalizeStartup());
-        assertEquals(PoppetWorldData.ImportState.COMPLETE, c.state());
+        assertEquals(PoppetWorldData.ImportState.DRAINED_CLEAN, c.state());
     }
 
     @Test
-    public void failureIsMonotonicAcrossDimensions() {
+    public void gapsDoNotPreventDrainCompletion() {
         WitcheryImportCoordinator c = new WitcheryImportCoordinator();
         assertFalse(c.inspect(0, new boolean[] { false }, 1));
-        assertFalse(c.inspect(1, new boolean[0], 1));
-        assertFalse(c.finalizeStartup());
-        assertEquals(PoppetWorldData.ImportState.FAILED, c.state());
+        assertTrue(c.inspect(1, new boolean[0], 1));
+        c.finish(1, 0, 0, 0);
+        assertTrue(c.finalizeStartup());
+        assertEquals(PoppetWorldData.ImportState.DRAINED_WITH_GAPS, c.state());
     }
 
     @Test
@@ -29,7 +30,7 @@ public class WitcheryImportCoordinatorTest {
         WitcheryImportCoordinator c = new WitcheryImportCoordinator();
         assertTrue(c.inspect(0, new boolean[] { true }, 1));
         assertFalse(c.finalizeStartup());
-        c.finish(0, 1, 1);
+        c.finish(0, 1, 1, 0);
         assertTrue(c.finalizeStartup());
     }
 
@@ -41,20 +42,22 @@ public class WitcheryImportCoordinatorTest {
     }
 
     @Test
-    public void recoveredStatesDoNotReopen() {
+    public void recoveredLegacyFailuresPermitCensusAfterDrain() {
         WitcheryImportCoordinator unknown = new WitcheryImportCoordinator();
         unknown.resume(PoppetWorldData.ImportState.UNKNOWN);
         assertTrue(unknown.finalizeStartup());
         WitcheryImportCoordinator interrupted = new WitcheryImportCoordinator();
         interrupted.resume(PoppetWorldData.ImportState.IN_PROGRESS);
-        assertEquals(PoppetWorldData.ImportState.FAILED, interrupted.state());
-        assertFalse(interrupted.finalizeStartup());
+        assertEquals(PoppetWorldData.ImportState.IN_PROGRESS, interrupted.state());
+        assertTrue(interrupted.finalizeStartup());
+        assertEquals(PoppetWorldData.ImportState.DRAINED_WITH_GAPS, interrupted.state());
         WitcheryImportCoordinator failed = new WitcheryImportCoordinator();
         failed.resume(PoppetWorldData.ImportState.FAILED);
-        assertEquals(PoppetWorldData.ImportState.FAILED, failed.state());
+        assertTrue(failed.finalizeStartup());
+        assertEquals(PoppetWorldData.ImportState.DRAINED_WITH_GAPS, failed.state());
         WitcheryImportCoordinator complete = new WitcheryImportCoordinator();
         complete.resume(PoppetWorldData.ImportState.COMPLETE);
-        assertEquals(PoppetWorldData.ImportState.COMPLETE, complete.state());
+        assertEquals(PoppetWorldData.ImportState.DRAINED_CLEAN, complete.state());
         assertFalse(complete.finalizeStartup());
     }
 
@@ -67,9 +70,18 @@ public class WitcheryImportCoordinatorTest {
             fail("resume must not clear an outstanding callback");
         } catch (IllegalStateException expected) {}
         assertFalse(c.finalizeStartup());
-        c.finish(0, 1, 1);
+        c.finish(0, 1, 1, 0);
         assertTrue(c.inspect(1, new boolean[] { true, true }, 2));
-        c.finish(1, 2, 2);
+        c.finish(1, 2, 2, 0);
         assertTrue(c.finalizeStartup());
+    }
+
+    @Test
+    public void releaseFailurePersistsGapWithoutLosingImportOutcome() {
+        WitcheryImportCoordinator c = new WitcheryImportCoordinator();
+        assertTrue(c.inspect(4, new boolean[] { true }, 1));
+        c.finish(4, 1, 1, 1);
+        assertTrue(c.finalizeStartup());
+        assertEquals(PoppetWorldData.ImportState.DRAINED_WITH_GAPS, c.state());
     }
 }

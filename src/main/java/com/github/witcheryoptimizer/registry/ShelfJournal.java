@@ -62,6 +62,14 @@ final class ShelfJournal {
         } catch (IllegalArgumentException exception) {
             throw new IOException("Invalid journal CensusState=" + root.getString("CensusState"), exception);
         }
+        if (root.getString("CensusState")
+            .equals(PoppetWorldData.CensusState.RETRY_WAIT.name()))
+            data.setCensusRetry(
+                root.getInteger("CensusVersion"),
+                root.getInteger("CensusRetryAttempt"),
+                root.getLong("CensusRetryAt"),
+                root.getBoolean("CensusRetryCorruption"),
+                root.getString("CensusRetryReason"));
     }
 
     void appendImportState(PoppetWorldData.ImportState state) throws IOException {
@@ -76,6 +84,25 @@ final class ShelfJournal {
         NBTTagCompound next = (NBTTagCompound) root.copy();
         next.setInteger("CensusVersion", version);
         next.setString("CensusState", state.name());
+        if (state == PoppetWorldData.CensusState.COMPLETE) {
+            next.removeTag("CensusRetryAttempt");
+            next.removeTag("CensusRetryAt");
+            next.removeTag("CensusRetryCorruption");
+            next.removeTag("CensusRetryReason");
+        }
+        next.setLong("Sequence", root.getLong("Sequence") + 1);
+        writeAndReplace(next, temporary, file);
+        root = next;
+    }
+
+    void appendCensusRetry(int version, int attempt, long at, boolean corruption, String reason) throws IOException {
+        NBTTagCompound next = (NBTTagCompound) root.copy();
+        next.setInteger("CensusVersion", version);
+        next.setString("CensusState", PoppetWorldData.CensusState.RETRY_WAIT.name());
+        next.setInteger("CensusRetryAttempt", attempt);
+        next.setLong("CensusRetryAt", at);
+        next.setBoolean("CensusRetryCorruption", corruption);
+        next.setString("CensusRetryReason", reason);
         next.setLong("Sequence", root.getLong("Sequence") + 1);
         writeAndReplace(next, temporary, file);
         root = next;
@@ -113,6 +140,13 @@ final class ShelfJournal {
         if (root.hasKey("CensusState")) {
             next.setInteger("CensusVersion", root.getInteger("CensusVersion"));
             next.setString("CensusState", root.getString("CensusState"));
+            if (root.getString("CensusState")
+                .equals(PoppetWorldData.CensusState.RETRY_WAIT.name())) {
+                next.setInteger("CensusRetryAttempt", root.getInteger("CensusRetryAttempt"));
+                next.setLong("CensusRetryAt", root.getLong("CensusRetryAt"));
+                next.setBoolean("CensusRetryCorruption", root.getBoolean("CensusRetryCorruption"));
+                next.setString("CensusRetryReason", root.getString("CensusRetryReason"));
+            }
         }
         next.setLong("Sequence", root.getLong("Sequence") + 1);
         writeAndReplace(next, temporary, file);

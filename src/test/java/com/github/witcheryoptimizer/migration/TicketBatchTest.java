@@ -28,9 +28,9 @@ public class TicketBatchTest {
             }
 
             @Override
-            public void finish(int successes, int offered) {
-                finish[0] = successes;
-                finish[1] = offered;
+            public void finish(TicketBatch.BatchResult result) {
+                finish[0] = result.imported;
+                finish[1] = result.offered;
             }
 
             @Override
@@ -59,7 +59,7 @@ public class TicketBatchTest {
                 }
 
                 @Override
-                public void finish(int successes, int offered) {
+                public void finish(TicketBatch.BatchResult result) {
                     finished[0] = true;
                 }
 
@@ -90,10 +90,11 @@ public class TicketBatchTest {
             }
 
             @Override
-            public void finish(int successes, int offered) {
+            public void finish(TicketBatch.BatchResult result) {
                 finishes[0]++;
-                assertEquals(2, successes);
-                assertEquals(3, offered);
+                assertEquals(3, result.imported);
+                assertEquals(3, result.offered);
+                assertEquals(1, result.releaseFailures);
             }
 
             @Override

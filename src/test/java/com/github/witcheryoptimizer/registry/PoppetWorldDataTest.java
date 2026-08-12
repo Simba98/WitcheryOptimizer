@@ -19,8 +19,9 @@ public class PoppetWorldDataTest {
         assertTrue(PoppetRegistry.shouldFinalizeImport(persisted));
         assertTrue(coordinator.finalizeStartup());
         persisted = coordinator.state();
-        assertEquals(PoppetWorldData.ImportState.COMPLETE, persisted);
-        assertTrue(PoppetRegistry.censusEligible(persisted, false, PoppetWorldData.CensusState.UNKNOWN, false, false));
+        assertEquals(PoppetWorldData.ImportState.DRAINED_CLEAN, persisted);
+        assertTrue(
+            PoppetRegistry.censusEligible(persisted, false, PoppetWorldData.CensusState.UNKNOWN, false, true, false));
     }
 
     @Test
@@ -31,7 +32,7 @@ public class PoppetWorldDataTest {
         assertEquals(PoppetWorldData.ImportState.IN_PROGRESS, coordinator.state());
         assertFalse(
             PoppetRegistry
-                .censusEligible(coordinator.state(), false, PoppetWorldData.CensusState.UNKNOWN, false, false));
+                .censusEligible(coordinator.state(), false, PoppetWorldData.CensusState.UNKNOWN, false, true, false));
     }
 
     @Test
@@ -39,17 +40,19 @@ public class PoppetWorldDataTest {
         assertFalse(PoppetRegistry.shouldFinalizeImport(PoppetWorldData.ImportState.COMPLETE));
         assertTrue(
             PoppetRegistry.censusEligible(
-                PoppetWorldData.ImportState.COMPLETE,
+                PoppetWorldData.ImportState.DRAINED_CLEAN,
                 false,
                 PoppetWorldData.CensusState.UNKNOWN,
                 false,
+                true,
                 false));
         assertFalse(
             PoppetRegistry.censusEligible(
-                PoppetWorldData.ImportState.COMPLETE,
+                PoppetWorldData.ImportState.DRAINED_CLEAN,
                 false,
                 PoppetWorldData.CensusState.UNKNOWN,
                 false,
+                true,
                 true));
     }
 
@@ -230,8 +233,57 @@ public class PoppetWorldDataTest {
         restored.writeToNBT(tag);
         PoppetWorldData interrupted = new PoppetWorldData();
         interrupted.readFromNBT(tag);
-        assertEquals(PoppetWorldData.CensusState.IN_PROGRESS, interrupted.censusState());
+        assertEquals(PoppetWorldData.CensusState.RETRY_WAIT, interrupted.censusState());
         assertFalse(interrupted.censusComplete(1));
+    }
+
+    @Test
+    public void completeClearsRetryAndNextFailureStartsAtOne() {
+        PoppetWorldData data = new PoppetWorldData();
+        data.setCensusRetry(1, 9, 1234L, true, "old failure");
+        data.setCensusState(1, PoppetWorldData.CensusState.COMPLETE);
+        assertEquals(0, data.retryAttempt());
+        assertEquals("", data.retryReason());
+        data.setCensusRetry(1, data.retryAttempt() + 1, 2000L, false, "new failure");
+        assertEquals(1, data.retryAttempt());
+    }
+
+    @Test
+    public void hashHostileNewDimensionsStillFormNumericSuffix() {
+        assertEquals(
+            java.util.Arrays.asList(0, 7, 1, 17, 33),
+            PoppetRegistry.deterministicDimensionOrder(
+                java.util.Arrays.asList(0),
+                java.util.Arrays.asList(7),
+                new java.util.HashSet<>(java.util.Arrays.asList(33, 1, 17))));
+    }
+
+    @Test
+    public void retryMetadataRoundTripsAndClamps() {
+        PoppetWorldData data = new PoppetWorldData();
+        data.setCensusRetry(1, 4, 120000L, true, "broken authority");
+        NBTTagCompound tag = new NBTTagCompound();
+        data.writeToNBT(tag);
+        PoppetWorldData restored = new PoppetWorldData();
+        restored.readFromNBT(tag);
+        assertEquals(PoppetWorldData.CensusState.RETRY_WAIT, restored.censusState());
+        assertEquals(4, restored.retryAttempt());
+        assertEquals(120000L, restored.retryAt(100000L));
+        tag.setLong("CensusRetryAt", Long.MAX_VALUE);
+        restored.readFromNBT(tag);
+        assertEquals(100000L, restored.retryAt(100000L));
+    }
+
+    @Test
+    public void legacyFailedCensusMigratesToRetryWait() {
+        PoppetWorldData data = new PoppetWorldData();
+        data.setCensusState(1, PoppetWorldData.CensusState.FAILED);
+        NBTTagCompound tag = new NBTTagCompound();
+        data.writeToNBT(tag);
+        PoppetWorldData restored = new PoppetWorldData();
+        restored.readFromNBT(tag);
+        assertEquals(PoppetWorldData.CensusState.RETRY_WAIT, restored.censusState());
+        assertFalse(restored.censusComplete(1));
     }
 
     @Test
@@ -372,6 +424,24 @@ public class PoppetWorldDataTest {
         assertTrue(PoppetRegistry.censusIdentityMatches(existing, null, tile));
         tile.setString("CustomName", "different");
         assertFalse(PoppetRegistry.censusIdentityMatches(existing, null, tile));
+    }
+
+    @Test
+    public void loadedPersistentUuidAtDifferentAuthorityIsCorruptionPreflight() {
+        UUID id = UUID.randomUUID();
+        ShelfLocation authoritative = new ShelfLocation(0, 1, 2, 3);
+        ShelfLocation loaded = new ShelfLocation(0, 9, 2, 3);
+        ShelfRecord record = new ShelfRecord(id, authoritative, "", 0, new net.minecraft.item.ItemStack[9]);
+        assertTrue(PoppetRegistry.loadedAuthorityConflict(true, id, loaded, record, null, false, false, false));
+    }
+
+    @Test
+    public void benignOperationalAttachFailureIsNotAuthorityConflict() {
+        UUID id = UUID.randomUUID();
+        ShelfLocation location = new ShelfLocation(0, 1, 2, 3);
+        ShelfRecord record = new ShelfRecord(id, location, "", 0, new net.minecraft.item.ItemStack[9]);
+        assertFalse(PoppetRegistry.loadedAuthorityConflict(true, id, location, record, record, false, false, false));
+        assertFalse(PoppetRegistry.loadedAuthorityConflict(false, null, location, null, null, false, false, false));
     }
 
     @Test

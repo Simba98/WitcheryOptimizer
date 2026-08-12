@@ -12,13 +12,14 @@ public final class TicketBatch {
 
         void release(T ticket);
 
-        void finish(int successes, int offered);
+        void finish(BatchResult result);
 
         void failure(T ticket, Throwable failure);
     }
 
     public static <T> void process(List<T> tickets, Actions<T> actions) {
         int successes = 0;
+        int releaseFailures = 0;
         Throwable firstFatal = null;
         for (T ticket : tickets) {
             boolean imported = false;
@@ -30,18 +31,20 @@ public final class TicketBatch {
             }
             try {
                 actions.release(ticket);
-                if (imported) successes++;
             } catch (Throwable failure) {
+                releaseFailures++;
                 report(actions, ticket, failure);
                 if (failure instanceof Error && firstFatal == null) firstFatal = failure;
             }
+            if (imported) successes++;
         }
         try {
-            actions.finish(successes, tickets.size());
+            actions.finish(new BatchResult(successes, tickets.size(), releaseFailures));
         } catch (Throwable failure) {
             report(actions, null, failure);
             if (failure instanceof Error && firstFatal == null) firstFatal = failure;
         }
+
         if (firstFatal instanceof Error) throw (Error) firstFatal;
         if (firstFatal instanceof RuntimeException) throw (RuntimeException) firstFatal;
     }
@@ -51,6 +54,17 @@ public final class TicketBatch {
             actions.failure(ticket, failure);
         } catch (Throwable ignored) {
             // Reporting must not prevent retained-ticket cleanup.
+        }
+    }
+
+    public static final class BatchResult {
+
+        public final int imported, offered, releaseFailures;
+
+        BatchResult(int imported, int offered, int releaseFailures) {
+            this.imported = imported;
+            this.offered = offered;
+            this.releaseFailures = releaseFailures;
         }
     }
 }

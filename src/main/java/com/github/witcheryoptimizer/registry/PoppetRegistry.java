@@ -32,6 +32,7 @@ import com.emoniph.witchery.blocks.BlockPoppetShelf.TileEntityPoppetShelf;
 import com.emoniph.witchery.util.Config;
 import com.github.witcheryoptimizer.WitcheryOptimizer;
 import com.github.witcheryoptimizer.migration.ShelfCensus;
+import com.github.witcheryoptimizer.migration.TicketBatch;
 import com.github.witcheryoptimizer.migration.WitcheryImportCoordinator;
 
 import cpw.mods.fml.common.eventhandler.EventPriority;
@@ -41,7 +42,7 @@ import cpw.mods.fml.common.gameevent.TickEvent;
 public final class PoppetRegistry {
 
     private static final PoppetRegistry INSTANCE = new PoppetRegistry();
-    private static final int CENSUS_VERSION = 1;
+    private static final int CENSUS_VERSION = 2;
     private final Map<TileEntityPoppetShelf, UUID> attached = new IdentityHashMap<>();
     private final Map<UUID, TileEntityPoppetShelf> loaded = new HashMap<>();
     private final Set<WorldServer> removalRecoverySaveBarriers = Collections
@@ -57,6 +58,8 @@ public final class PoppetRegistry {
     private final WitcheryImportCoordinator importCoordinator = new WitcheryImportCoordinator();
     private long serverTick;
     private boolean censusAttempted;
+    private long nextInitializationTick;
+    private int initializationAttempts;
 
     public static PoppetRegistry instance() {
         return INSTANCE;
@@ -77,6 +80,8 @@ public final class PoppetRegistry {
         placementAuthorizations.clear();
         importCoordinator.resetForServerStop();
         censusAttempted = false;
+        nextInitializationTick = 0;
+        initializationAttempts = 0;
     }
 
     @SubscribeEvent
@@ -127,14 +132,17 @@ public final class PoppetRegistry {
             serverTick++;
             clearStaleRemovalAtTick();
             placementAuthorizations.expire(serverTick);
+            if (data == null && serverTick >= nextInitializationTick) initialize();
             if (data != null) processLoadedCleanup();
             if (data != null && shouldFinalizeImport(data.importState()) && importCoordinator.finalizeStartup())
                 persistCoordinatorState();
+            long now = System.currentTimeMillis();
             if (data != null && censusEligible(
                 data.importState(),
                 data.censusComplete(CENSUS_VERSION),
                 data.censusState(),
                 censusAttempted,
+                data.retryDue(now),
                 !removalRecoverySaveBarriers.isEmpty())) {
                 censusAttempted = true;
                 runCensus();
@@ -147,10 +155,13 @@ public final class PoppetRegistry {
     }
 
     static boolean censusEligible(PoppetWorldData.ImportState importState, boolean censusComplete,
-        PoppetWorldData.CensusState censusState, boolean censusAttempted, boolean recoveryAwaitingSave) {
-        return importState == PoppetWorldData.ImportState.COMPLETE && !censusComplete
-            && censusState != PoppetWorldData.CensusState.FAILED
+        PoppetWorldData.CensusState censusState, boolean censusAttempted, boolean retryDue,
+        boolean recoveryAwaitingSave) {
+        return (importState == PoppetWorldData.ImportState.COMPLETE
+            || importState == PoppetWorldData.ImportState.DRAINED_CLEAN
+            || importState == PoppetWorldData.ImportState.DRAINED_WITH_GAPS) && !censusComplete
             && !censusAttempted
+            && (censusState != PoppetWorldData.CensusState.RETRY_WAIT || retryDue)
             && !recoveryAwaitingSave;
     }
 
@@ -613,8 +624,8 @@ public final class PoppetRegistry {
         return accepted;
     }
 
-    public void finishWitcheryTickets(int dimension, int successes, int offered) {
-        importCoordinator.finish(dimension, successes, offered);
+    public void finishWitcheryTickets(int dimension, TicketBatch.BatchResult result) {
+        importCoordinator.finish(dimension, result.imported, result.offered, result.releaseFailures);
         persistCoordinatorState();
     }
 
@@ -626,14 +637,14 @@ public final class PoppetRegistry {
             data.setImportState(state);
         } catch (IOException exception) {
             importCoordinator.fail();
-            data.setImportState(PoppetWorldData.ImportState.FAILED);
+            data.setImportState(PoppetWorldData.ImportState.DRAINED_WITH_GAPS);
             WitcheryOptimizer.LOG.error("Unable to persist Witchery ticket import state", exception);
         }
     }
 
     public boolean plausibleWitcheryTicket(Ticket ticket) {
         NBTTagCompound tag = ticket.getModData();
-        return tag.hasKey("poppetX") && tag.hasKey("poppetY") && tag.hasKey("poppetZ");
+        return tag.hasKey("poppetX", 3) && tag.hasKey("poppetY", 3) && tag.hasKey("poppetZ", 3);
     }
 
     public boolean importWitcheryTicket(Ticket ticket, net.minecraft.world.World world) {
@@ -659,6 +670,12 @@ public final class PoppetRegistry {
             importLoadedShelvesInObservedOrder();
             ShelfCensus.Snapshot census = ShelfCensus
                 .scan(DimensionManager.getCurrentSaveRootDirectory(), data.dimensionOrder());
+            List<Integer> loadedPrefix = new ArrayList<>();
+            for (WorldServer world : orderedServerWorlds())
+                if (world != null) loadedPrefix.add(world.provider.dimensionId);
+            data.normalizeDimensionOrder(
+                deterministicDimensionOrder(loadedPrefix, data.dimensionOrder(), census.dimensions.keySet()));
+            rebuildAllowedDimensions();
             Set<ShelfLocation> reconciledRemovals = reconcilePreparedRemovals(census);
             for (ShelfCensus.Entry entry : census.entries) {
                 ShelfLocation location = new ShelfLocation(
@@ -669,22 +686,23 @@ public final class PoppetRegistry {
                 if (reconciledRemovals.contains(location)) continue;
                 data.observeDimension(entry.dimension);
                 LocationResolution existing = resolveLocation(location);
-                if (existing.multiple) throw new IOException("Multiple authoritative records at " + location);
+                if (existing.multiple)
+                    throw new ShelfCensus.CensusException("Multiple authoritative records at " + location);
                 boolean uuidMost = entry.tile.hasKey("WOShelfUuidMost");
                 boolean uuidLeast = entry.tile.hasKey("WOShelfUuidLeast");
-                if (uuidMost != uuidLeast) throw new IOException("Partial shelf UUID at " + location);
+                if (uuidMost != uuidLeast) throw new ShelfCensus.CensusException("Partial shelf UUID at " + location);
                 UUID physicalId = uuidMost
                     ? new UUID(entry.tile.getLong("WOShelfUuidMost"), entry.tile.getLong("WOShelfUuidLeast"))
                     : null;
                 if (existing.record != null) {
                     if (!censusIdentityMatches(existing.record, physicalId, entry.tile))
-                        throw new IOException("Census identity/content conflict at " + location);
+                        throw new ShelfCensus.CensusException("Census identity/content conflict at " + location);
                     continue;
                 }
                 UUID id = physicalId == null ? UUID.randomUUID() : physicalId;
                 ShelfRecord byId = data.get(id);
                 if (byId != null && !byId.location.equals(location))
-                    throw new IOException("Census found copied shelf UUID " + id + " at " + location);
+                    throw new ShelfCensus.CensusException("Census found copied shelf UUID " + id + " at " + location);
                 ShelfRecord record = data
                     .newRecord(id, location, entry.tile.getString("CustomName"), items(entry.tile));
                 journal.appendPost(record);
@@ -695,20 +713,62 @@ public final class PoppetRegistry {
                 data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.UNKNOWN);
                 return;
             }
-            if (data.hasPreparedRemovals()) throw new IOException("Unresolved prepared shelf removal remains");
+            if (data.hasPreparedRemovals())
+                throw new ShelfCensus.CensusException("Unresolved prepared shelf removal remains");
+            verifyActiveRecords(census);
             journal.appendCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.COMPLETE);
             data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.COMPLETE);
             data.markDirty();
         } catch (IOException | RuntimeException exception) {
+            int attempt = data.retryAttempt() + 1;
+            boolean corruption = exception instanceof ShelfCensus.CensusException
+                && ((ShelfCensus.CensusException) exception).isCorruption();
+            long retryAt = System.currentTimeMillis() + RetryPolicy.delay(attempt, corruption);
+            String reason = exception.getClass()
+                .getSimpleName() + ": "
+                + String.valueOf(exception.getMessage());
+            if (reason.length() > 160) reason = reason.substring(0, 160);
             try {
-                journal.appendCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.FAILED);
+                journal.appendCensusRetry(CENSUS_VERSION, attempt, retryAt, corruption, reason);
             } catch (IOException persistence) {
                 exception.addSuppressed(persistence);
             }
-            data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.FAILED);
+            data.setCensusRetry(CENSUS_VERSION, attempt, retryAt, corruption, reason);
+            censusAttempted = false;
             WitcheryOptimizer.LOG.error("Exhaustive shelf census failed; lookup remains fail-closed", exception);
         }
 
+    }
+
+    private void verifyActiveRecords(ShelfCensus.Snapshot census) throws IOException {
+        Set<UUID> disk = new HashSet<>();
+        for (ShelfCensus.Entry entry : census.entries) {
+            ShelfLocation location = new ShelfLocation(
+                entry.dimension,
+                entry.tile.getInteger("x"),
+                entry.tile.getInteger("y"),
+                entry.tile.getInteger("z"));
+            LocationResolution resolution = resolveLocation(location);
+            if (resolution.record != null && resolution.record.state == ShelfRecord.State.ACTIVE
+                && censusIdentityMatches(resolution.record, physicalId(entry.tile), entry.tile))
+                disk.add(resolution.record.id);
+        }
+        for (ShelfRecord record : data.records()) {
+            if (record.state != ShelfRecord.State.ACTIVE || disk.contains(record.id)) continue;
+            TileEntityPoppetShelf shelf = loaded.get(record.id);
+            if (!activeRecordProven(
+                record.state,
+                disk.contains(record.id),
+                shelf != null && !shelf.isInvalid()
+                    && location(shelf).equals(record.location)
+                    && record.id.equals(attached.get(shelf))))
+                throw new ShelfCensus.CensusException(
+                    "Active authoritative shelf has no physical proof at " + record.location);
+        }
+    }
+
+    static boolean activeRecordProven(ShelfRecord.State state, boolean exactDisk, boolean exactLoaded) {
+        return state != ShelfRecord.State.ACTIVE || exactDisk || exactLoaded;
     }
 
     private Set<ShelfLocation> reconcilePreparedRemovals(ShelfCensus.Snapshot census) throws IOException {
@@ -720,7 +780,7 @@ public final class PoppetRegistry {
                 entry.tile.getInteger("y"),
                 entry.tile.getInteger("z"));
             if (physical.put(location, entry) != null)
-                throw new IOException("Multiple physical shelves at " + location);
+                throw new ShelfCensus.CensusException("Multiple physical shelves at " + location);
         }
         Set<ShelfLocation> handled = new HashSet<>();
         for (ShelfRecord record : data.records()) {
@@ -737,8 +797,8 @@ public final class PoppetRegistry {
                 record.removalDropsStarted,
                 hasDrops,
                 completeDrops);
-            if (recovery == RemovalRecovery.UNRESOLVED)
-                throw new IOException("Cannot safely reconcile prepared shelf removal at " + record.location);
+            if (recovery == RemovalRecovery.UNRESOLVED) throw new ShelfCensus.CensusException(
+                "Cannot safely reconcile prepared shelf removal at " + record.location);
             if (recovery == RemovalRecovery.RESTORE) {
                 ShelfRecord restored = ShelfRecord.read(record.write());
                 restored.version++;
@@ -809,13 +869,38 @@ public final class PoppetRegistry {
             data.observeDimension(world.provider.dimensionId);
             for (Object value : world.loadedTileEntityList) if (value instanceof TileEntityPoppetShelf) {
                 TileEntityPoppetShelf shelf = (TileEntityPoppetShelf) value;
-                LocationResolution resolution = resolveLocation(location(shelf));
+                ShelfLocation shelfLocation = location(shelf);
+                LocationResolution resolution = resolveLocation(shelfLocation);
                 if (resolution.record != null && resolution.record.state == ShelfRecord.State.REMOVAL_PREPARED)
                     continue;
+                PoppetShelfState state = (PoppetShelfState) shelf;
+                UUID id = state.witcheryoptimizer$getShelfId();
+                ShelfRecord byId = id == null ? null : data.get(id);
+                boolean duplicateLoaded = id != null && loaded.containsKey(id) && loaded.get(id) != shelf;
+                if (loadedAuthorityConflict(
+                    state.witcheryoptimizer$hasPersistentShelfId(),
+                    id,
+                    shelfLocation,
+                    byId,
+                    resolution.record,
+                    resolution.multiple,
+                    duplicateLoaded,
+                    id != null && data.isTombstoned(id)))
+                    throw new ShelfCensus.CensusException(
+                        "Loaded shelf has conflicting persistent authority at " + shelfLocation);
                 if (!attach(shelf)) throw new IOException(
                     "Loaded shelf reconciliation failed in dimension " + world.provider.dimensionId);
             }
         }
+    }
+
+    static boolean loadedAuthorityConflict(boolean persistent, UUID id, ShelfLocation location, ShelfRecord byId,
+        ShelfRecord atLocation, boolean multipleAtLocation, boolean duplicateLoaded, boolean tombstoned) {
+        if (!persistent || id == null) return multipleAtLocation;
+        return tombstoned || duplicateLoaded
+            || byId != null && !byId.location.equals(location)
+            || atLocation != null && !atLocation.id.equals(id)
+            || multipleAtLocation;
     }
 
     static boolean censusIdentityMatches(ShelfRecord existing, UUID physicalId, NBTTagCompound tile)
@@ -847,7 +932,10 @@ public final class PoppetRegistry {
     }
 
     public ItemStack find(EntityPlayer player, Matcher matcher) {
-        if (!initialize() || data.importState() != PoppetWorldData.ImportState.COMPLETE
+        if (!initialize()
+            || (data.importState() != PoppetWorldData.ImportState.COMPLETE
+                && data.importState() != PoppetWorldData.ImportState.DRAINED_CLEAN
+                && data.importState() != PoppetWorldData.ImportState.DRAINED_WITH_GAPS)
             || !data.censusComplete(CENSUS_VERSION)) return null;
         Set<UUID> visited = new HashSet<>();
         for (WorldServer world : orderedServerWorlds()) {
@@ -1009,6 +1097,7 @@ public final class PoppetRegistry {
 
     private synchronized boolean initialize() {
         if (data != null) return true;
+        if (serverTick < nextInitializationTick) return false;
         MinecraftServer server = MinecraftServer.getServer();
         if (server == null || server.worldServers == null) return false;
         WorldServer primary = null;
@@ -1019,32 +1108,39 @@ public final class PoppetRegistry {
             }
         }
         if (primary == null) return false;
-        data = PoppetWorldData.get(primary);
         try {
+            data = PoppetWorldData.get(primary);
             journal = new ShelfJournal(primary);
             journal.recover(data);
             PoppetWorldData.ImportState recovered = data.importState();
             importCoordinator.resume(recovered);
-            if (recovered == PoppetWorldData.ImportState.IN_PROGRESS) {
-                journal.appendImportState(PoppetWorldData.ImportState.FAILED);
-                data.setImportState(PoppetWorldData.ImportState.FAILED);
+            if (recovered == PoppetWorldData.ImportState.IN_PROGRESS
+                || recovered == PoppetWorldData.ImportState.FAILED) {
+                journal.appendImportState(PoppetWorldData.ImportState.DRAINED_WITH_GAPS);
+                data.setImportState(PoppetWorldData.ImportState.DRAINED_WITH_GAPS);
+                importCoordinator.resume(PoppetWorldData.ImportState.DRAINED_WITH_GAPS);
             }
-            if (data.censusState() == PoppetWorldData.CensusState.IN_PROGRESS) {
-                journal.appendCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.FAILED);
-                data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.FAILED);
+            if (data.censusState() == PoppetWorldData.CensusState.IN_PROGRESS
+                || data.censusState() == PoppetWorldData.CensusState.FAILED) {
+                long at = System.currentTimeMillis() + RetryPolicy.TRANSIENT_BASE;
+                journal.appendCensusRetry(CENSUS_VERSION, 1, at, false, "Interrupted census");
+                data.setCensusRetry(CENSUS_VERSION, 1, at, false, "Interrupted census");
             }
             if (requiresRemovalCensus(data.censusComplete(CENSUS_VERSION), data.hasPreparedRemovals())) {
                 journal.appendCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.UNKNOWN);
                 data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.UNKNOWN);
             }
             rebuildAllowedDimensions();
+            initializationAttempts = 0;
             WitcheryOptimizer.LOG
                 .info("Witchery Optimizer started with {} pending shelf NBT writeback(s)", data.pendingWritebacks());
             return true;
-        } catch (IOException exception) {
+        } catch (IOException | RuntimeException exception) {
             WitcheryOptimizer.LOG.error("Witchery Optimizer storage initialization failed closed", exception);
             data = null;
             journal = null;
+            initializationAttempts++;
+            nextInitializationTick = serverTick + RetryPolicy.initializationDelayTicks(initializationAttempts);
             return false;
         }
     }

@@ -69,24 +69,98 @@ public class ShelfCensusTest {
     }
 
     @Test
-    public void unknownDimensionFolderFailsClosed() throws Exception {
+    public void unregisteredDimensionFolderIsDiscovered() throws Exception {
         java.io.File root = java.nio.file.Files.createTempDirectory("wo-dims-")
             .toFile();
         try {
             assertTrue(new java.io.File(root, "DIM77").mkdir());
             java.util.Map<Integer, String> known = new java.util.HashMap<>();
             known.put(0, null);
-            try {
-                ShelfCensus.scanFolders(root, known);
-                fail("unknown dimension must fail census");
-            } catch (java.io.IOException expected) {
-                assertTrue(
-                    expected.getMessage()
-                        .contains("DIM77"));
-            }
+            ShelfCensus.Snapshot snapshot = ShelfCensus.scanFolders(root, known);
+            assertEquals("DIM77", snapshot.dimensions.get(77));
         } finally {
             new java.io.File(root, "DIM77").delete();
             root.delete();
+        }
+    }
+
+    @Test
+    public void persistedUnregisteredDimensionUsesStandardFolderThroughPublicFlow() throws Exception {
+        java.io.File root = temporary("wo-public-dim-");
+        try {
+            assertTrue(new java.io.File(root, "DIM181").mkdir());
+            ShelfCensus.Snapshot snapshot = ShelfCensus.scan(root, java.util.Arrays.asList(181));
+            assertEquals("DIM181", snapshot.dimensions.get(181));
+        } finally {
+            delete(root);
+        }
+    }
+
+    @Test
+    public void negativeDimensionAndReturnedMappingsAreDiscovered() throws Exception {
+        java.io.File root = temporary("wo-negative-dim-");
+        try {
+            assertTrue(new java.io.File(root, "DIM-42").mkdir());
+            ShelfCensus.Snapshot snapshot = ShelfCensus.scanFolders(root, singletonRoot());
+            assertTrue(snapshot.dimensions.containsKey(0));
+            assertEquals("DIM-42", snapshot.dimensions.get(-42));
+        } finally {
+            delete(root);
+        }
+    }
+
+    @Test
+    public void malformedOverflowAndUnmappedRegionFoldersFailClearly() throws Exception {
+        for (String name : new String[] { "DIM2147483648", "DIM+2", "TwilightForest" }) {
+            java.io.File root = temporary("wo-invalid-dim-");
+            try {
+                regionBearing(root, name);
+                try {
+                    ShelfCensus.scanFolders(root, singletonRoot());
+                    fail(name + " must fail");
+                } catch (java.io.IOException expected) {
+                    assertTrue(
+                        expected.getMessage()
+                            .contains(name));
+                }
+            } finally {
+                delete(root);
+            }
+        }
+    }
+
+    @Test
+    public void registeredCustomFolderWithRegionDataIsMapped() throws Exception {
+        java.io.File root = temporary("wo-custom-dim-");
+        try {
+            java.io.File region = new java.io.File(new java.io.File(root, "TwilightForest"), "region");
+            assertTrue(region.mkdirs());
+            java.util.Map<Integer, String> known = singletonRoot();
+            known.put(7, "TwilightForest");
+            ShelfCensus.Snapshot snapshot = ShelfCensus.scanFolders(root, known);
+            assertEquals("TwilightForest", snapshot.dimensions.get(7));
+        } finally {
+            delete(root);
+        }
+    }
+
+    @Test
+    public void canonicalIdConflictFailsClosed() throws Exception {
+        java.io.File root = temporary("wo-id-conflict-");
+        try {
+            assertTrue(new java.io.File(root, "DIM2").mkdir());
+            java.util.Map<Integer, String> known = singletonRoot();
+            known.put(2, "custom");
+            try {
+                ShelfCensus.scanFolders(root, known);
+                fail("one ID cannot map to two canonical folders");
+            } catch (java.io.IOException expected) {
+                assertTrue(
+                    expected.getMessage()
+                        .contains("maps to both"));
+            }
+        } finally {
+            delete(root);
         }
     }
 
@@ -169,6 +243,35 @@ public class ShelfCensusTest {
         entity.setTag("ForgeData", forge);
         entity.setTag("Item", itemNbt(count));
         return entity;
+    }
+
+    @Test
+    public void censusFailureClassificationDistinguishesAuthorityFromIo() {
+        assertTrue(new ShelfCensus.CensusException("identity conflict").isCorruption());
+        assertFalse(new ShelfCensus.CensusException("enumeration failed", false).isCorruption());
+    }
+
+    private static java.io.File temporary(String prefix) throws java.io.IOException {
+        return java.nio.file.Files.createTempDirectory(prefix)
+            .toFile();
+    }
+
+    private static java.util.Map<Integer, String> singletonRoot() {
+        java.util.Map<Integer, String> known = new java.util.HashMap<>();
+        known.put(0, null);
+        return known;
+    }
+
+    private static void regionBearing(java.io.File root, String name) throws java.io.IOException {
+        java.io.File region = new java.io.File(new java.io.File(root, name), "region");
+        assertTrue(region.mkdirs());
+        assertTrue(new java.io.File(region, "marker.mcr").createNewFile());
+    }
+
+    private static void delete(java.io.File file) {
+        java.io.File[] children = file.listFiles();
+        if (children != null) for (java.io.File child : children) delete(child);
+        file.delete();
     }
 
 }

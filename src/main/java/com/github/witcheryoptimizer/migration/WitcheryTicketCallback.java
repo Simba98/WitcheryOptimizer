@@ -17,8 +17,9 @@ public final class WitcheryTicketCallback implements OrderedLoadingCallback {
     public List<Ticket> ticketsLoaded(List<Ticket> tickets, World world, int maxTicketCount) {
         PoppetRegistry registry = PoppetRegistry.instance();
         if (!registry.inspectWitcheryTickets(world.provider.dimensionId, tickets, maxTicketCount)) {
-            WitcheryOptimizer.LOG
-                .error("Restored Witchery tickets failed validation in dimension {}", world.provider.dimensionId);
+            WitcheryOptimizer.LOG.error(
+                "Restored Witchery tickets have gaps in dimension {}; rejecting the batch for Forge to release",
+                world.provider.dimensionId);
             return new ArrayList<>();
         }
         return new ArrayList<>(tickets);
@@ -40,8 +41,8 @@ public final class WitcheryTicketCallback implements OrderedLoadingCallback {
             }
 
             @Override
-            public void finish(int successes, int offered) {
-                registry.finishWitcheryTickets(world.provider.dimensionId, successes, offered);
+            public void finish(TicketBatch.BatchResult result) {
+                registry.finishWitcheryTickets(world.provider.dimensionId, result);
             }
 
             @Override
