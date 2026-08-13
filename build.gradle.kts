@@ -7,7 +7,7 @@ plugins {
     id("com.gtnewhorizons.gtnhconvention")
 }
 
-version = "0.2.2"
+version = "0.2.3"
 
 val validateProductionJar by tasks.registering {
     group = "verification"

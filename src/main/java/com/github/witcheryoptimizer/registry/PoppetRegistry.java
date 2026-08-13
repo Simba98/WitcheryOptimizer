@@ -635,6 +635,13 @@ public final class PoppetRegistry {
         try {
             journal.appendImportState(state);
             data.setImportState(state);
+            if (state == PoppetWorldData.ImportState.DRAINED_CLEAN
+                || state == PoppetWorldData.ImportState.DRAINED_WITH_GAPS)
+                WitcheryOptimizer.LOG.info(
+                    "Witchery ticket drain completed: state={}, authoritativeShelves={}",
+                    state,
+                    data.records()
+                        .size());
         } catch (IOException exception) {
             importCoordinator.fail();
             data.setImportState(PoppetWorldData.ImportState.DRAINED_WITH_GAPS);
@@ -664,6 +671,14 @@ public final class PoppetRegistry {
     }
 
     private void runCensus() {
+        int attempt = data.retryAttempt() + 1;
+        WitcheryOptimizer.LOG.info(
+            "Starting exhaustive shelf census: attempt={}, knownDimensions={}, authoritativeShelves={}",
+            attempt,
+            data.dimensionOrder()
+                .size(),
+            data.records()
+                .size());
         try {
             journal.appendCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.IN_PROGRESS);
             data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.IN_PROGRESS);
@@ -719,8 +734,14 @@ public final class PoppetRegistry {
             journal.appendCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.COMPLETE);
             data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.COMPLETE);
             data.markDirty();
+            WitcheryOptimizer.LOG.info(
+                "Shelf census complete: dimensions={}, physicalShelves={}, authoritativeShelves={}, pendingWritebacks={}",
+                census.dimensions.size(),
+                census.entries.size(),
+                data.records()
+                    .size(),
+                data.pendingWritebacks());
         } catch (IOException | RuntimeException exception) {
-            int attempt = data.retryAttempt() + 1;
             boolean corruption = exception instanceof ShelfCensus.CensusException
                 && ((ShelfCensus.CensusException) exception).isCorruption();
             long retryAt = System.currentTimeMillis() + RetryPolicy.delay(attempt, corruption);
@@ -735,7 +756,12 @@ public final class PoppetRegistry {
             }
             data.setCensusRetry(CENSUS_VERSION, attempt, retryAt, corruption, reason);
             censusAttempted = false;
-            WitcheryOptimizer.LOG.error("Exhaustive shelf census failed; lookup remains fail-closed", exception);
+            WitcheryOptimizer.LOG.error(
+                "Exhaustive shelf census failed; lookup remains fail-closed, class={}, attempt={}, retryAt={}",
+                corruption ? "corruption" : "transient",
+                attempt,
+                retryAt,
+                exception);
         }
 
     }
@@ -1132,8 +1158,18 @@ public final class PoppetRegistry {
             }
             rebuildAllowedDimensions();
             initializationAttempts = 0;
-            WitcheryOptimizer.LOG
-                .info("Witchery Optimizer started with {} pending shelf NBT writeback(s)", data.pendingWritebacks());
+            WitcheryOptimizer.LOG.info(
+                "Witchery Optimizer initialized: importState={}, censusState={}, authoritativeShelves={}, dimensions={}, pendingWritebacks={}, retryAttempt={}, retryAt={}, retryReason={}",
+                data.importState(),
+                data.censusState(),
+                data.records()
+                    .size(),
+                data.dimensionOrder()
+                    .size(),
+                data.pendingWritebacks(),
+                data.retryAttempt(),
+                data.retryAt(System.currentTimeMillis()),
+                data.retryReason());
             return true;
         } catch (IOException | RuntimeException exception) {
             WitcheryOptimizer.LOG.error("Witchery Optimizer storage initialization failed closed", exception);

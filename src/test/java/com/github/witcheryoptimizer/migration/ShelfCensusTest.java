@@ -19,9 +19,9 @@ public class ShelfCensusTest {
         tiles.appendTag(other);
         NBTTagCompound shelf = new NBTTagCompound();
         shelf.setString("id", "witchery:poppetshelf");
-        shelf.setInteger("x", 33);
+        shelf.setInteger("x", 547);
         shelf.setInteger("y", 70);
-        shelf.setInteger("z", -4);
+        shelf.setInteger("z", -461);
         shelf.setString("CustomName", "complete");
         shelf.setTag("Items", new NBTTagList());
         tiles.appendTag(shelf);
@@ -32,6 +32,53 @@ public class ShelfCensusTest {
         assertEquals(1, found.size());
         assertEquals(1, found.get(0).tileSequence);
         assertEquals("complete", found.get(0).tile.getString("CustomName"));
+    }
+
+    @Test
+    public void shelfCoordinatesMustMatchPhysicalChunkIncludingNegativeCoordinates() throws Exception {
+        NBTTagCompound valid = shelf(547, 255, -461);
+        ShelfCensus.validateShelfCoordinates(1, -1, 2, 3, valid);
+        for (NBTTagCompound invalid : new NBTTagCompound[] { shelf(543, 70, -461), shelf(547, 70, -465),
+            shelf(547, -1, -461), shelf(547, 256, -461) }) {
+            try {
+                ShelfCensus.validateShelfCoordinates(1, -1, 2, 3, invalid);
+                fail("invalid shelf coordinates must fail census");
+            } catch (ShelfCensus.CensusException expected) {
+                assertTrue(expected.isCorruption());
+            }
+        }
+    }
+
+    @Test
+    public void missingOrNonIntegerShelfCoordinatesFailClosed() throws Exception {
+        NBTTagCompound missing = shelf(0, 64, 0);
+        missing.removeTag("x");
+        NBTTagCompound wrongType = shelf(0, 64, 0);
+        wrongType.setLong("z", 0L);
+        for (NBTTagCompound invalid : new NBTTagCompound[] { missing, wrongType }) {
+            try {
+                ShelfCensus.validateShelfCoordinates(0, 0, 0, 0, invalid);
+                fail("unproven shelf coordinates must fail census");
+            } catch (ShelfCensus.CensusException expected) {
+                assertTrue(expected.isCorruption());
+            }
+        }
+    }
+
+    @Test
+    public void foreignTileCoordinatesAreNotValidatedAsShelves() throws Exception {
+        NBTTagCompound chunk = new NBTTagCompound();
+        NBTTagCompound level = new NBTTagCompound();
+        NBTTagList tiles = new NBTTagList();
+        NBTTagCompound foreign = new NBTTagCompound();
+        foreign.setString("id", "Chest");
+        foreign.setString("x", "invalid");
+        tiles.appendTag(foreign);
+        level.setTag("TileEntities", tiles);
+        chunk.setTag("Level", level);
+        assertTrue(
+            ShelfCensus.extract(0, 0, 0, 0, 0, chunk)
+                .isEmpty());
     }
 
     @Test(expected = java.io.IOException.class)
@@ -222,6 +269,15 @@ public class ShelfCensusTest {
         level.setTag("Entities", new NBTTagList());
         chunk.setTag("Level", level);
         return chunk;
+    }
+
+    private static NBTTagCompound shelf(int x, int y, int z) {
+        NBTTagCompound shelf = new NBTTagCompound();
+        shelf.setString("id", "witchery:poppetshelf");
+        shelf.setInteger("x", x);
+        shelf.setInteger("y", y);
+        shelf.setInteger("z", z);
+        return shelf;
     }
 
     private static NBTTagCompound itemNbt(int count) {

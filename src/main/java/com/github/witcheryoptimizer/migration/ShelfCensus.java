@@ -262,14 +262,41 @@ public final class ShelfCensus {
     }
 
     private static List<Entry> extractTiles(int dimension, int regionX, int regionZ, int localX, int localZ,
-        NBTTagCompound level) {
+        NBTTagCompound level) throws IOException {
         NBTTagList tiles = level.getTagList("TileEntities", 10);
         List<Entry> entries = new ArrayList<>();
         for (int sequence = 0; sequence < tiles.tagCount(); sequence++) {
             NBTTagCompound tile = tiles.getCompoundTagAt(sequence);
-            if (isShelf(tile)) entries.add(new Entry(dimension, regionX, regionZ, localX, localZ, sequence, tile));
+            if (isShelf(tile)) {
+                validateShelfCoordinates(regionX, regionZ, localX, localZ, tile);
+                entries.add(new Entry(dimension, regionX, regionZ, localX, localZ, sequence, tile));
+            }
         }
         return entries;
+    }
+
+    static void validateShelfCoordinates(int regionX, int regionZ, int localX, int localZ, NBTTagCompound tile)
+        throws IOException {
+        if (localX < 0 || localX >= 32 || localZ < 0 || localZ >= 32)
+            throw new CensusException("Invalid physical chunk slot " + localX + "," + localZ);
+        if (!tile.hasKey("x", 3) || !tile.hasKey("y", 3) || !tile.hasKey("z", 3))
+            throw new CensusException("Poppet shelf has missing or non-integer coordinates");
+        int x = tile.getInteger("x");
+        int y = tile.getInteger("y");
+        int z = tile.getInteger("z");
+        long expectedChunkX = (long) regionX * 32L + localX;
+        long expectedChunkZ = (long) regionZ * 32L + localZ;
+        if (Math.floorDiv(x, 16) != expectedChunkX || Math.floorDiv(z, 16) != expectedChunkZ) throw new CensusException(
+            "Poppet shelf coordinates " + x
+                + ","
+                + y
+                + ","
+                + z
+                + " do not belong to physical chunk "
+                + expectedChunkX
+                + ","
+                + expectedChunkZ);
+        if (y < 0 || y >= 256) throw new CensusException("Poppet shelf has invalid Y coordinate " + y);
     }
 
     static void sortEntries(List<Entry> entries) {
