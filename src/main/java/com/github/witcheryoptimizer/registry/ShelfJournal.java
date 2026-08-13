@@ -33,10 +33,58 @@ final class ShelfJournal {
                 .getWorldDirectory());
     }
 
-    private static void validateSchema(NBTTagCompound value) throws IOException {
+    private static void validateRoot(NBTTagCompound value) throws IOException {
         if (value == null) return;
-        if (!value.hasKey("Schema", 3) || value.getInteger("Schema") != PoppetWorldData.SCHEMA)
-            throw new IOException("Unsupported optimizer journal: required integer Schema=" + PoppetWorldData.SCHEMA);
+        try {
+            StrictNbt.require(value, "Schema", 3);
+            if (value.getInteger("Schema") != PoppetWorldData.SCHEMA)
+                throw new IllegalStateException("Unsupported journal schema");
+            StrictNbt.nonnegativeLong(value, "Sequence");
+            NBTTagList operations = StrictNbt.list(value, "Entries", 10);
+            Map<UUID, Boolean> identities = new LinkedHashMap<>();
+            for (int index = 0; index < operations.tagCount(); index++) {
+                NBTTagCompound operation = operations.getCompoundTagAt(index);
+                StrictNbt.require(operation, "Kind", 8);
+                String kind = operation.getString("Kind");
+                UUID identity;
+                if ("PUT".equals(kind)) {
+                    StrictNbt.require(operation, "Record", 10);
+                    identity = ShelfRecord.read(operation.getCompoundTag("Record")).id;
+                } else if ("DELETE".equals(kind)) {
+                    StrictNbt.require(operation, "ShelfMost", 4);
+                    StrictNbt.require(operation, "ShelfLeast", 4);
+                    StrictNbt.nonnegativeLong(operation, "Generation");
+                    if (operation.hasKey("Location")) {
+                        StrictNbt.require(operation, "Location", 10);
+                        ShelfLocation.read(operation.getCompoundTag("Location"));
+                    }
+                    StrictNbt.optionalPair(operation, "RemovalMost", "RemovalLeast", 4);
+                    identity = uuid(operation, "Shelf");
+                } else throw new IllegalStateException("Invalid journal operation kind " + kind);
+                if (identities.put(identity, Boolean.TRUE) != null)
+                    throw new IllegalStateException("Duplicate journal shelf operation " + identity);
+            }
+            if (value.hasKey("ImportState")) {
+                StrictNbt.require(value, "ImportState", 8);
+                PoppetWorldData.ImportState.valueOf(value.getString("ImportState"));
+            }
+            if (value.hasKey("CensusState") != value.hasKey("CensusVersion"))
+                throw new IllegalStateException("Partial validation metadata");
+            if (value.hasKey("CensusState")) {
+                StrictNbt.require(value, "CensusState", 8);
+                PoppetWorldData.CensusState state = PoppetWorldData.CensusState.valueOf(value.getString("CensusState"));
+                StrictNbt.nonnegativeInt(value, "CensusVersion");
+                if (state == PoppetWorldData.CensusState.RETRY_WAIT) {
+                    if (StrictNbt.nonnegativeInt(value, "CensusRetryAttempt") == 0)
+                        throw new IllegalStateException("Zero retry attempt");
+                    StrictNbt.nonnegativeLong(value, "CensusRetryAt");
+                    StrictNbt.require(value, "CensusRetryCorruption", 1);
+                    StrictNbt.require(value, "CensusRetryReason", 8);
+                }
+            }
+        } catch (RuntimeException exception) {
+            throw new IOException("Invalid optimizer journal root", exception);
+        }
     }
 
     ShelfJournal(File directory) throws IOException {
@@ -177,10 +225,12 @@ final class ShelfJournal {
             if (file.exists() || temporary.exists()) throw new IOException("No valid optimizer journal copy exists");
             NBTTagCompound fresh = new NBTTagCompound();
             fresh.setInteger("Schema", PoppetWorldData.SCHEMA);
+            fresh.setLong("Sequence", 0);
+            fresh.setTag("Entries", new NBTTagList());
             return fresh;
         }
-        validateSchema(main);
-        validateSchema(temp);
+        validateRoot(main);
+        validateRoot(temp);
         if (temp != null && (main == null || temp.getLong("Sequence") > main.getLong("Sequence"))) {
             replace(temporary.toPath(), file.toPath());
             forceDirectory();

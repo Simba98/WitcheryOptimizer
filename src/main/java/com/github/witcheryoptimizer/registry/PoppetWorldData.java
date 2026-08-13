@@ -20,7 +20,6 @@ public final class PoppetWorldData extends WorldSavedData {
     private final Map<UUID, ShelfRecord> shelves = new LinkedHashMap<>();
     private final Map<UUID, Long> tombstones = new LinkedHashMap<>();
     private final Map<UUID, ShelfLocation> tombstoneLocations = new LinkedHashMap<>();
-    private final Map<UUID, UUID> committedRemovals = new LinkedHashMap<>();
     private final List<Integer> dimensionOrder = new ArrayList<>();
     private long nextOrder;
     private ImportState importState = ImportState.UNKNOWN;
@@ -50,34 +49,51 @@ public final class PoppetWorldData extends WorldSavedData {
 
     @Override
     public void readFromNBT(NBTTagCompound root) {
-        if (!root.hasKey("Schema") || root.getInteger("Schema") != SCHEMA) throw new IllegalStateException(
+        if (!root.hasKey("Schema", 3)) throw new IllegalStateException(
             "Unsupported WitcheryOptimizer v0.1/schema-1 world data; only schema " + SCHEMA + " is accepted");
+        if (root.getInteger("Schema") != SCHEMA) throw new IllegalStateException(
+            "Unsupported WitcheryOptimizer v0.1/schema-1 world data; only schema " + SCHEMA + " is accepted");
+        StrictNbt.require(root, "NextOrder", 4);
+        StrictNbt.require(root, "Tombstones", 9);
+        StrictNbt.require(root, "Shelves", 9);
+        StrictNbt.require(root, "DimensionOrder", 11);
         shelves.clear();
         tombstones.clear();
         tombstoneLocations.clear();
-        committedRemovals.clear();
         dimensionOrder.clear();
-        nextOrder = root.getLong("NextOrder");
-        NBTTagList deleted = root.getTagList("Tombstones", 10);
+        nextOrder = StrictNbt.nonnegativeLong(root, "NextOrder");
+        NBTTagList deleted = StrictNbt.list(root, "Tombstones", 10);
         for (int i = 0; i < deleted.tagCount(); i++) {
             NBTTagCompound tag = deleted.getCompoundTagAt(i);
             UUID id = uuid(tag, "Shelf");
-            tombstones.put(id, tag.getLong("Generation"));
-            if (tag.hasKey("Location")) tombstoneLocations.put(id, ShelfLocation.read(tag.getCompoundTag("Location")));
-            if (tag.hasKey("RemovalMost", 4) && tag.hasKey("RemovalLeast", 4))
-                committedRemovals.put(new UUID(tag.getLong("RemovalMost"), tag.getLong("RemovalLeast")), id);
+            long generation = StrictNbt.nonnegativeLong(tag, "Generation");
+            if (tombstones.put(id, generation) != null)
+                throw new IllegalStateException("Duplicate shelf tombstone " + id);
+            if (tag.hasKey("Location")) {
+                StrictNbt.require(tag, "Location", 10);
+                tombstoneLocations.put(id, ShelfLocation.read(tag.getCompoundTag("Location")));
+            }
         }
-        NBTTagList list = root.getTagList("Shelves", 10);
+        NBTTagList list = StrictNbt.list(root, "Shelves", 10);
         for (int i = 0; i < list.tagCount(); i++) install(ShelfRecord.read(list.getCompoundTagAt(i)));
         int[] dimensions = root.getIntArray("DimensionOrder");
-        for (int dimension : dimensions) dimensionOrder.add(dimension);
+        for (int dimension : dimensions) {
+            if (dimensionOrder.contains(dimension))
+                throw new IllegalStateException("Duplicate dimension order " + dimension);
+            dimensionOrder.add(dimension);
+        }
         importState = requiredState(root, "WitcheryImportState", ImportState.class);
-        censusVersion = root.getInteger("CensusVersion");
+        if (root.hasKey("CensusVersion")) censusVersion = StrictNbt.nonnegativeInt(root, "CensusVersion");
+        else censusVersion = 0;
         censusState = root.hasKey("CensusState") ? requiredState(root, "CensusState", CensusState.class)
             : CensusState.UNKNOWN;
-        retryAttempt = Math.max(0, root.getInteger("CensusRetryAttempt"));
+        retryAttempt = root.hasKey("CensusRetryAttempt") ? StrictNbt.nonnegativeInt(root, "CensusRetryAttempt") : 0;
+        if (root.hasKey("CensusRetryAt")) StrictNbt.require(root, "CensusRetryAt", 4);
         retryAt = root.getLong("CensusRetryAt");
+        if (retryAt < 0) throw new IllegalStateException("Negative validation retry deadline");
+        if (root.hasKey("CensusRetryCorruption")) StrictNbt.require(root, "CensusRetryCorruption", 1);
         retryCorruption = root.getBoolean("CensusRetryCorruption");
+        if (root.hasKey("CensusRetryReason")) StrictNbt.require(root, "CensusRetryReason", 8);
         retryReason = root.getString("CensusRetryReason");
         if (censusState == CensusState.IN_PROGRESS || censusState == CensusState.FAILED)
             censusState = CensusState.RETRY_WAIT;
@@ -104,18 +120,6 @@ public final class PoppetWorldData extends WorldSavedData {
             tag.setLong("Generation", entry.getValue());
             ShelfLocation location = tombstoneLocations.get(entry.getKey());
             if (location != null) tag.setTag("Location", location.write());
-            for (Map.Entry<UUID, UUID> committed : committedRemovals.entrySet()) if (committed.getValue()
-                .equals(entry.getKey())) {
-                    tag.setLong(
-                        "RemovalMost",
-                        committed.getKey()
-                            .getMostSignificantBits());
-                    tag.setLong(
-                        "RemovalLeast",
-                        committed.getKey()
-                            .getLeastSignificantBits());
-                    break;
-                }
             deleted.appendTag(tag);
         }
         root.setTag("Tombstones", deleted);
@@ -210,21 +214,31 @@ public final class PoppetWorldData extends WorldSavedData {
         if (old == null || old < generation) {
             tombstones.put(id, generation);
             if (location != null) tombstoneLocations.put(id, location);
-            if (transaction != null) committedRemovals.put(transaction, id);
         }
         markDirty();
     }
 
     void applyJournal(NBTTagCompound operation) {
-        if ("DELETE".equals(operation.getString("Kind"))) delete(
+        StrictNbt.require(operation, "Kind", 8);
+        String kind = operation.getString("Kind");
+        if ("DELETE".equals(kind)) delete(
             uuid(operation, "Shelf"),
-            operation.getLong("Generation"),
-            operation.hasKey("Location") ? ShelfLocation.read(operation.getCompoundTag("Location")) : null,
-            operation.hasKey("RemovalMost", 4) && operation.hasKey("RemovalLeast", 4)
+            StrictNbt.nonnegativeLong(operation, "Generation"),
+            location(operation),
+            StrictNbt.optionalPair(operation, "RemovalMost", "RemovalLeast", 4)
                 ? new UUID(operation.getLong("RemovalMost"), operation.getLong("RemovalLeast"))
                 : null);
-        else install(ShelfRecord.read(operation.getCompoundTag("Record")));
+        else if ("PUT".equals(kind)) {
+            StrictNbt.require(operation, "Record", 10);
+            install(ShelfRecord.read(operation.getCompoundTag("Record")));
+        } else throw new IllegalStateException("Invalid journal operation kind " + kind);
         markDirty();
+    }
+
+    private static ShelfLocation location(NBTTagCompound operation) {
+        if (!operation.hasKey("Location")) return null;
+        StrictNbt.require(operation, "Location", 10);
+        return ShelfLocation.read(operation.getCompoundTag("Location"));
     }
 
     ImportState importState() {
@@ -307,10 +321,6 @@ public final class PoppetWorldData extends WorldSavedData {
         return false;
     }
 
-    boolean isCommittedRemoval(UUID transaction) {
-        return transaction != null && committedRemovals.containsKey(transaction);
-    }
-
     public enum ImportState {
         UNKNOWN,
         IN_PROGRESS,
@@ -329,7 +339,7 @@ public final class PoppetWorldData extends WorldSavedData {
     }
 
     private static <E extends Enum<E>> E requiredState(NBTTagCompound root, String key, Class<E> type) {
-        if (!root.hasKey(key)) throw new IllegalStateException("Missing optimizer state " + key);
+        StrictNbt.require(root, key, 8);
         try {
             return Enum.valueOf(type, root.getString(key));
         } catch (IllegalArgumentException exception) {
@@ -338,6 +348,8 @@ public final class PoppetWorldData extends WorldSavedData {
     }
 
     private static UUID uuid(NBTTagCompound tag, String prefix) {
+        StrictNbt.require(tag, prefix + "Most", 4);
+        StrictNbt.require(tag, prefix + "Least", 4);
         return new UUID(tag.getLong(prefix + "Most"), tag.getLong(prefix + "Least"));
     }
 

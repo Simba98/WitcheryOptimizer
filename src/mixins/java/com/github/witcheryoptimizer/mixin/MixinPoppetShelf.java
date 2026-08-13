@@ -2,6 +2,7 @@ package com.github.witcheryoptimizer.mixin;
 
 import java.util.UUID;
 
+import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.world.World;
 import net.minecraftforge.common.ForgeChunkManager;
@@ -14,6 +15,7 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import com.emoniph.witchery.blocks.BlockPoppetShelf.TileEntityPoppetShelf;
 import com.github.witcheryoptimizer.registry.PoppetRegistry;
@@ -132,6 +134,11 @@ public abstract class MixinPoppetShelf implements PoppetShelfState {
     private void witcheryoptimizer$inventoryChanged(CallbackInfo ci) {
         PoppetRegistry.instance()
             .changed((TileEntityPoppetShelf) (Object) this);
+    }
+
+    @Inject(method = "getStackInSlotOnClosing(I)Lnet/minecraft/item/ItemStack;", at = @At("RETURN"), remap = true)
+    private void witcheryoptimizer$closingChanged(int slot, CallbackInfoReturnable<ItemStack> cir) {
+        if (cir.getReturnValue() != null) ((TileEntityPoppetShelf) (Object) this).markDirty();
     }
 
     @Inject(method = "invalidate", at = @At("HEAD"), remap = true)

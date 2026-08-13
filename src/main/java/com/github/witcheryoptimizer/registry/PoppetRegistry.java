@@ -12,8 +12,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
-import net.minecraft.entity.Entity;
-import net.minecraft.entity.item.EntityItem;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.inventory.IInventory;
 import net.minecraft.item.ItemStack;
@@ -21,7 +19,7 @@ import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.tileentity.TileEntity;
 import net.minecraft.world.WorldServer;
-import net.minecraft.world.storage.ThreadedFileIOBase;
+import net.minecraft.world.chunk.storage.AnvilChunkLoader;
 import net.minecraftforge.common.DimensionManager;
 import net.minecraftforge.common.ForgeChunkManager;
 import net.minecraftforge.common.ForgeChunkManager.Ticket;
@@ -31,7 +29,6 @@ import net.minecraftforge.event.world.WorldEvent;
 import com.emoniph.witchery.blocks.BlockPoppetShelf.TileEntityPoppetShelf;
 import com.emoniph.witchery.util.Config;
 import com.github.witcheryoptimizer.WitcheryOptimizer;
-import com.github.witcheryoptimizer.migration.ShelfCensus;
 import com.github.witcheryoptimizer.migration.TicketBatch;
 import com.github.witcheryoptimizer.migration.WitcheryImportCoordinator;
 
@@ -41,23 +38,39 @@ import cpw.mods.fml.common.gameevent.TickEvent;
 
 public final class PoppetRegistry {
 
+    public enum SetBlockRemoval {
+        AUTHORITATIVE,
+        PHYSICAL_CLEANUP,
+        TRANSIENT_FAILURE
+    }
+
+    private enum RemovalMode {
+        AUTHORITATIVE,
+        PHYSICAL_CLEANUP
+    }
+
+    enum StartupValidationDecision {
+        DELETE,
+        RETRY,
+        MIRROR
+    }
+
     private static final PoppetRegistry INSTANCE = new PoppetRegistry();
-    private static final int CENSUS_VERSION = 2;
+    private static final int VALIDATION_VERSION = 3;
     private final Map<TileEntityPoppetShelf, UUID> attached = new IdentityHashMap<>();
     private final Map<UUID, TileEntityPoppetShelf> loaded = new HashMap<>();
-    private final Set<WorldServer> removalRecoverySaveBarriers = Collections
-        .newSetFromMap(new IdentityHashMap<WorldServer, Boolean>());
     private final Set<Integer> allowedDimensions = new HashSet<>();
     private final List<Integer> dimensionOrder = new ArrayList<>();
     private final ThreadLocal<Boolean> synchronizing = ThreadLocal.withInitial(() -> false);
+    private final ThreadLocal<ShelfRecord> startupValidation = new ThreadLocal<>();
+    private final ThreadLocal<DiskLoadObservation> startupDiskLoad = new ThreadLocal<>();
     private PoppetWorldData data;
     private ShelfJournal journal;
-    private final ThreadLocal<RemovalTransaction> removal = new ThreadLocal<>();
-    private final ThreadLocal<CleanupContext> cleanupRemoval = new ThreadLocal<>();
+    private final ThreadLocal<RemovalContext> pendingRemoval = new ThreadLocal<>();
+    private final ThreadLocal<RemovalContext> activeRemoval = new ThreadLocal<>();
     private final PlacementAuthorizations<TileEntityPoppetShelf> placementAuthorizations = new PlacementAuthorizations<>();
     private final WitcheryImportCoordinator importCoordinator = new WitcheryImportCoordinator();
     private long serverTick;
-    private boolean censusAttempted;
     private long nextInitializationTick;
     private int initializationAttempts;
 
@@ -70,45 +83,27 @@ public final class PoppetRegistry {
             .info("Witchery Optimizer stopping with {} pending shelf NBT writeback(s)", data.pendingWritebacks());
         attached.clear();
         loaded.clear();
-        removalRecoverySaveBarriers.clear();
         allowedDimensions.clear();
         dimensionOrder.clear();
         data = null;
         journal = null;
-        removal.remove();
-        cleanupRemoval.remove();
+        pendingRemoval.remove();
+        activeRemoval.remove();
         placementAuthorizations.clear();
         importCoordinator.resetForServerStop();
-        censusAttempted = false;
         nextInitializationTick = 0;
         initializationAttempts = 0;
     }
 
     @SubscribeEvent
     public void onWorldLoad(WorldEvent.Load event) {
-        if (!event.world.isRemote && initialize()) refreshAllowedDimensions();
+        if (!event.world.isRemote && startupValidation.get() == null && initialize()) refreshAllowedDimensions();
     }
 
     @SubscribeEvent
     public void onWorldUnload(WorldEvent.Unload event) {
         if (!event.world.isRemote) {
             placementAuthorizations.clear();
-        }
-    }
-
-    @SubscribeEvent(priority = EventPriority.LOWEST)
-    public void onWorldSave(WorldEvent.Save event) {
-        if (event.world.isRemote || !removalRecoverySaveBarriers.contains(event.world)) return;
-        try {
-            ThreadedFileIOBase.threadedIOInstance.waitForFinish();
-            removalRecoverySaveBarriers.remove(event.world);
-            if (removalRecoverySaveBarriers.isEmpty()) censusAttempted = false;
-        } catch (InterruptedException exception) {
-            Thread.currentThread()
-                .interrupt();
-            WitcheryOptimizer.LOG.error(
-                "Shelf removal recovery remains blocked because asynchronous chunk persistence was interrupted",
-                exception);
         }
     }
 
@@ -133,20 +128,8 @@ public final class PoppetRegistry {
             clearStaleRemovalAtTick();
             placementAuthorizations.expire(serverTick);
             if (data == null && serverTick >= nextInitializationTick) initialize();
-            if (data != null) processLoadedCleanup();
             if (data != null && shouldFinalizeImport(data.importState()) && importCoordinator.finalizeStartup())
                 persistCoordinatorState();
-            long now = System.currentTimeMillis();
-            if (data != null && censusEligible(
-                data.importState(),
-                data.censusComplete(CENSUS_VERSION),
-                data.censusState(),
-                censusAttempted,
-                data.retryDue(now),
-                !removalRecoverySaveBarriers.isEmpty())) {
-                censusAttempted = true;
-                runCensus();
-            }
         }
     }
 
@@ -169,11 +152,31 @@ public final class PoppetRegistry {
         return censusComplete && preparedRemovals;
     }
 
+    static boolean quarantineDuringStartupValidation(ShelfRecord.State state) {
+        return state != ShelfRecord.State.ACTIVE;
+    }
+
     public boolean attach(TileEntityPoppetShelf shelf) {
         if (!usable(shelf) || !initialize()) return false;
         PoppetShelfState state = (PoppetShelfState) shelf;
         UUID id = state.witcheryoptimizer$getShelfId();
         ShelfLocation location = location(shelf);
+        ShelfRecord validating = startupValidation.get();
+        if (validating != null && validating.location.equals(location)) {
+            // Chunk loading invokes Witchery initiate(). Non-active records must remain physically untouched
+            // until validation has enough positive evidence to choose a recovery action.
+            if (validating.state != ShelfRecord.State.ACTIVE) return false;
+            if (!startupIdentityMatches(
+                state.witcheryoptimizer$hasPersistentShelfId(),
+                state.witcheryoptimizer$getShelfId(),
+                validating.id)) return false;
+            TileEntityPoppetShelf duplicate = loaded.get(validating.id);
+            if (duplicate != null && duplicate != shelf) return false;
+            mirror(validating, shelf);
+            attached.put(shelf, validating.id);
+            loaded.put(validating.id, shelf);
+            return true;
+        }
         boolean authorizedPlacement = placementAuthorizations.consume(shelf, location, serverTick);
         if (state.witcheryoptimizer$hasPersistentShelfId() && id != null && data.isTombstoned(id)) {
             WitcheryOptimizer.LOG.error("Tombstoned shelf UUID {} rejected at {}", id, location);
@@ -259,7 +262,9 @@ public final class PoppetRegistry {
     }
 
     public void changed(TileEntityPoppetShelf shelf) {
-        if (Boolean.TRUE.equals(synchronizing.get()) || !usable(shelf) || !initialize()) return;
+        if (removalSuppressesShelf(shelf) || Boolean.TRUE.equals(synchronizing.get())
+            || !usable(shelf)
+            || !initialize()) return;
         UUID id = attached.get(shelf);
         if (id == null) {
             attach(shelf);
@@ -282,7 +287,7 @@ public final class PoppetRegistry {
     }
 
     public void prepareWrite(TileEntityPoppetShelf shelf) {
-        if (!usable(shelf) || !initialize()) return;
+        if (removalSuppressesShelf(shelf) || !usable(shelf) || !initialize()) return;
         if (!attached.containsKey(shelf)) attach(shelf);
         ShelfRecord record = data.get(attached.get(shelf));
         if (record != null && record.state == ShelfRecord.State.ACTIVE) mirror(record, shelf);
@@ -331,285 +336,186 @@ public final class PoppetRegistry {
         if (id != null && loaded.get(id) == shelf) loaded.remove(id);
     }
 
-    public boolean preRemove(net.minecraft.world.World world, int x, int y, int z) {
-        if (world.isRemote || !initialize()) return false;
-        RemovalTransaction existing = removal.get();
+    public SetBlockRemoval beginSetBlock(net.minecraft.world.World world, int x, int y, int z) {
+        if (world.isRemote || !initialize()) return SetBlockRemoval.TRANSIENT_FAILURE;
+        if (!canBeginRemoval(pendingRemoval.get() != null, activeRemoval.get() != null))
+            return SetBlockRemoval.TRANSIENT_FAILURE;
         ShelfLocation target = new ShelfLocation(world.provider.dimensionId, x, y, z);
         placementAuthorizations.removeLocation(target);
-        if (!allowNewRemoval(existing != null)) {
-            removal.remove();
-            invalidateCensusForPreparedRemoval(existing.world);
-            WitcheryOptimizer.LOG.error(
-                "Stale shelf removal transaction {} detected before {}; new removal denied",
-                existing.transaction,
-                target);
-            return false;
+        TileEntity tile = world.getTileEntity(target.x, target.y, target.z);
+        if (!(tile instanceof TileEntityPoppetShelf)) {
+            LocationResolution resolution = resolveLocation(target);
+            MissingTileRemoval decision = classifyMissingTileRemoval(resolution.record != null, resolution.multiple);
+            if (decision == MissingTileRemoval.TRANSIENT_FAILURE) return SetBlockRemoval.TRANSIENT_FAILURE;
+            if (decision == MissingTileRemoval.DELETE_THEN_CLEANUP
+                && !deleteStaleAuthority(resolution.record, "exact shelf TE is absent during removal"))
+                return SetBlockRemoval.TRANSIENT_FAILURE;
+            pendingRemoval.set(RemovalContext.cleanup(world, target, null));
+            return SetBlockRemoval.PHYSICAL_CLEANUP;
         }
-        TileEntity tile = world.getTileEntity(x, y, z);
-        if (!(tile instanceof TileEntityPoppetShelf)) return false;
         TileEntityPoppetShelf shelf = (TileEntityPoppetShelf) tile;
-        if (!attach(shelf)) return false;
+        // Resolve and attach before publishing either removal context. Publishing first would make
+        // normal lifecycle callbacks observe a removal that has not yet been durably committed.
+        if (!attach(shelf)) {
+            if (!physicalCleanupCandidate(shelf, target)) return SetBlockRemoval.TRANSIENT_FAILURE;
+            pendingRemoval.set(RemovalContext.cleanup(world, target, shelf));
+            return SetBlockRemoval.PHYSICAL_CLEANUP;
+        }
         ShelfRecord record = data.get(attached.get(shelf));
-        if (record == null || !record.location.equals(target)) return false;
-        mirror(record, shelf);
-        ShelfRecord before = ShelfRecord.read(record.write());
-        try {
-            ShelfRecord prepared = ShelfRecord.read(record.write());
-            prepared.version++;
-            prepared.state = ShelfRecord.State.REMOVAL_PREPARED;
-            prepared.removalTransaction = UUID.randomUUID();
-            prepared.removalSourceVersion = record.version;
-            journal.appendPost(prepared);
-            data.install(prepared);
-        } catch (IOException exception) {
-            WitcheryOptimizer.LOG
-                .error("Block removal denied because shelf tombstone could not be persisted", exception);
-            return false;
-        }
-        removal.set(new RemovalTransaction(world, target, before, shelf, data.get(record.id).removalTransaction));
-        return true;
-    }
-
-    public boolean spawnRemovalDrop(net.minecraft.world.World world, Entity entity) {
-        RemovalTransaction transaction = removal.get();
-        if (transaction == null || !(entity instanceof EntityItem)) return world.spawnEntityInWorld(entity);
-        if (!transaction.matchesWorld(world)) {
-            removal.remove();
-            invalidateCensusForPreparedRemoval(transaction.world);
-            WitcheryOptimizer.LOG.error("Cross-world shelf removal drop denied for {}", transaction.transaction);
-            return false;
-        }
-        if (transaction.nextDrop == 0) {
-            ShelfRecord prepared = data.get(transaction.before.id);
-            if (prepared == null || prepared.state != ShelfRecord.State.REMOVAL_PREPARED
-                || !transaction.transaction.equals(prepared.removalTransaction)) return false;
-            if (!prepared.removalDropsStarted) {
-                ShelfRecord started = ShelfRecord.read(prepared.write());
-                started.version++;
-                started.removalDropsStarted = true;
-                try {
-                    journal.appendPost(started);
-                    data.install(started);
-                } catch (IOException exception) {
-                    WitcheryOptimizer.LOG
-                        .error("Shelf drop denied because its removal stage could not be persisted", exception);
-                    return false;
-                }
-            }
-        }
-        NBTTagCompound forgeData = entity.getEntityData();
-        forgeData.setLong("WORemovalMost", transaction.transaction.getMostSignificantBits());
-        forgeData.setLong("WORemovalLeast", transaction.transaction.getLeastSignificantBits());
-        forgeData.setInteger("WODropOrdinal", transaction.nextDrop++);
-        forgeData.setBoolean("WORemovalLocked", true);
-        ((EntityItem) entity).delayBeforeCanPickup = Short.MAX_VALUE;
-        return world.spawnEntityInWorld(entity);
-    }
-
-    public void finishRemove(net.minecraft.world.World world, int x, int y, int z, boolean succeeded) {
-        RemovalTransaction transaction = removal.get();
-        ShelfLocation target = new ShelfLocation(world.provider.dimensionId, x, y, z);
-        if (transaction == null) return;
-        if (!transaction.matches(world, target)) {
-            removal.remove();
-            invalidateCensusForPreparedRemoval(transaction.world);
-            WitcheryOptimizer.LOG.error("Mismatched shelf removal finish denied for {}", transaction.transaction);
-            return;
-        }
-        try {
-            boolean shelfBlock = world.getBlock(x, y, z) == com.emoniph.witchery.Witchery.Blocks.POPPET_SHELF;
-            boolean exactOriginal = world.getTileEntity(x, y, z) == transaction.shelf;
-            RemovalOutcome outcome = removalOutcome(shelfBlock, exactOriginal, transaction.nextDrop > 0);
-            if (outcome == RemovalOutcome.RESTORE_EXACT_ORIGINAL) {
-                ShelfRecord restored = ShelfRecord.read(transaction.before.write());
-                restored.version = transaction.before.version + 2;
-                try {
-                    journal.appendPost(restored);
-                    data.install(restored);
-                    data.markDirty();
-                    mirror(restored, transaction.shelf);
-                } catch (IOException exception) {
-                    WitcheryOptimizer.LOG.error("Failed block replacement remains quarantined", exception);
-                }
-            } else if (outcome == RemovalOutcome.COMMIT_AND_UNLOCK) {
-                if (commitRemoval(data.get(transaction.before.id), transaction.transaction))
-                    unlockLoadedDrops(transaction.transaction);
-            }
-        } finally {
-            removal.remove();
-        }
-    }
-
-    private void clearStaleRemovalAtTick() {
-        RemovalTransaction stale = removal.get();
-        if (!shouldClearStaleAtTick(stale != null)) return;
-        removal.remove();
-        invalidateCensusForPreparedRemoval(stale.world);
-        WitcheryOptimizer.LOG.error(
-            "Cleared shelf removal transaction {} left by an exceptional World.setBlock exit; recovery remains fail-closed",
-            stale.transaction);
-    }
-
-    private void invalidateCensusForPreparedRemoval(net.minecraft.world.World world) {
-        if (world instanceof WorldServer) removalRecoverySaveBarriers.add((WorldServer) world);
-        censusAttempted = !removalRecoverySaveBarriers.isEmpty();
-        if (data == null || journal == null || !data.censusComplete(CENSUS_VERSION)) return;
-        try {
-            journal.appendCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.UNKNOWN);
-            data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.UNKNOWN);
-        } catch (IOException exception) {
-            data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.FAILED);
-            WitcheryOptimizer.LOG.error("Unable to reopen census after stale shelf removal", exception);
-        }
-    }
-
-    static boolean allowNewRemoval(boolean existingTransaction) {
-        return !existingTransaction;
-    }
-
-    static boolean shouldClearStaleAtTick(boolean existingTransaction) {
-        return existingTransaction;
-    }
-
-    static boolean transactionContextMatches(boolean sameWorld, ShelfLocation expected, ShelfLocation actual) {
-        return sameWorld && expected.equals(actual);
-    }
-
-    private boolean commitRemoval(ShelfRecord record) {
-        return commitRemoval(record, record.removalTransaction);
-    }
-
-    private boolean commitRemoval(ShelfRecord record, UUID transaction) {
-        if (record == null) return false;
-        long generation = record.version + 3;
+        if (record == null || record.state != ShelfRecord.State.ACTIVE || !record.location.equals(target))
+            return SetBlockRemoval.TRANSIENT_FAILURE;
+        ItemStack[] snapshot = copyInventory(record.inventory);
+        long generation = record.version + 1;
         try {
             journal.appendDelete(record, generation);
-            data.delete(record.id, generation, record.location, transaction);
+            data.delete(record.id, generation, record.location);
+        } catch (IOException exception) {
+            WitcheryOptimizer.LOG
+                .error("Shelf removal denied because its authority deletion was not durable", exception);
+            return SetBlockRemoval.TRANSIENT_FAILURE;
+        }
+        pendingRemoval.set(RemovalContext.authoritative(world, target, shelf, snapshot));
+        return SetBlockRemoval.AUTHORITATIVE;
+    }
+
+    private boolean deleteStaleAuthority(ShelfRecord record, String reason) {
+        long generation = record.version + 1;
+        try {
+            journal.appendDelete(record, generation);
+            data.delete(record.id, generation, record.location, record.removalTransaction);
+            WitcheryOptimizer.LOG.warn("Deleted stale shelf authority at {}: {}", record.location, reason);
             return true;
         } catch (IOException exception) {
             WitcheryOptimizer.LOG
-                .error("Physical shelf outcome could not be finalized; location remains quarantined", exception);
+                .error("Shelf cleanup denied because stale authority deletion was not durable", exception);
             return false;
         }
     }
 
-    static RemovalOutcome removalOutcome(boolean shelfBlock, boolean exactOriginalTile, boolean dropsStarted) {
-        if (shelfBlock && exactOriginalTile && !dropsStarted) return RemovalOutcome.RESTORE_EXACT_ORIGINAL;
-        if (!shelfBlock) return RemovalOutcome.COMMIT_AND_UNLOCK;
-        return RemovalOutcome.AWAIT_DURABLE_RECONCILIATION;
-    }
-
-    enum RemovalOutcome {
-        RESTORE_EXACT_ORIGINAL,
-        COMMIT_AND_UNLOCK,
-        AWAIT_DURABLE_RECONCILIATION
-    }
-
-    public boolean shouldLockRemovalDrop(EntityItem item) {
-        UUID transaction = removalDropTransaction(item.getEntityData());
-        if (transaction == null) return false;
-        if (data == null && !initialize()) return true;
-        if (!lockRemovalDrop(item.getEntityData(), data.isCommittedRemoval(transaction))) {
-            unlockRemovalDrop(item);
-            return false;
-        }
-        return true;
-    }
-
-    static boolean lockRemovalDrop(NBTTagCompound tag, boolean committed) {
-        return removalDropTransaction(tag) != null && !committed;
-    }
-
-    public boolean isAuthorizedCleanupRemoval(net.minecraft.world.World world, int x, int y, int z) {
-        CleanupContext context = cleanupRemoval.get();
-        return context != null && context.matches(world, x, y, z, world.getTileEntity(x, y, z));
-    }
-
-    public boolean suppressCleanupBreak(TileEntityPoppetShelf shelf) {
-        CleanupContext context = cleanupRemoval.get();
-        if (context == null || !context.matches(shelf.getWorldObj(), shelf.xCoord, shelf.yCoord, shelf.zCoord, shelf))
-            return false;
-        detach(shelf);
-        return true;
-    }
-
-    static UUID removalDropTransaction(NBTTagCompound tag) {
-        boolean most = tag.hasKey("WORemovalMost");
-        boolean least = tag.hasKey("WORemovalLeast");
-        boolean ordinal = tag.hasKey("WODropOrdinal");
-        if (!most && !least && !ordinal) return null;
-        if (!most || !least || !ordinal) return new UUID(0, 0);
-        return new UUID(tag.getLong("WORemovalMost"), tag.getLong("WORemovalLeast"));
-    }
-
-    private void unlockLoadedDrops(UUID transaction) {
-        for (WorldServer world : orderedServerWorlds())
-            if (world != null) for (Object value : world.loadedEntityList) if (value instanceof EntityItem) {
-                EntityItem item = (EntityItem) value;
-                if (transaction.equals(removalDropTransaction(item.getEntityData()))) unlockRemovalDrop(item);
-            }
-    }
-
-    private static void unlockRemovalDrop(EntityItem item) {
-        NBTTagCompound tag = item.getEntityData();
-        tag.removeTag("WORemovalMost");
-        tag.removeTag("WORemovalLeast");
-        tag.removeTag("WODropOrdinal");
-        tag.removeTag("WORemovalLocked");
-        item.delayBeforeCanPickup = 0;
-        item.age = 0;
-    }
-
-    private void processLoadedCleanup() {
-        for (ShelfRecord record : data.records()) {
-            if (record.state != ShelfRecord.State.REMOVAL_CLEANUP_PENDING) continue;
-            WorldServer world = DimensionManager.getWorld(record.location.dimension);
-            if (world == null || !world.blockExists(record.location.x, record.location.y, record.location.z)) continue;
-            TileEntity tile = world.getTileEntity(record.location.x, record.location.y, record.location.z);
-            if (!(tile instanceof TileEntityPoppetShelf)) continue;
-            try {
-                if (!preparedLiveMatches(record, (TileEntityPoppetShelf) tile)) continue;
-                CleanupContext context = new CleanupContext(world, record, (TileEntityPoppetShelf) tile);
-                cleanupRemoval.set(context);
-                boolean removed;
-                try {
-                    removed = world.setBlockToAir(record.location.x, record.location.y, record.location.z);
-                } finally {
-                    cleanupRemoval.remove();
-                }
-                if (removed && world.getBlock(record.location.x, record.location.y, record.location.z)
-                    != com.emoniph.witchery.Witchery.Blocks.POPPET_SHELF) {
-                    if (commitRemoval(record)) {
-                        unlockLoadedDrops(record.removalTransaction);
-                        censusAttempted = false;
-                        journal.appendCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.UNKNOWN);
-                        data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.UNKNOWN);
-                    }
-                }
-            } catch (IOException exception) {
-                WitcheryOptimizer.LOG.error("Removal cleanup remains fail-closed at {}", record.location, exception);
-            }
-        }
-    }
-
-    private boolean preparedLiveMatches(ShelfRecord record, TileEntityPoppetShelf shelf) {
+    private boolean physicalCleanupCandidate(TileEntityPoppetShelf shelf, ShelfLocation target) {
         PoppetShelfState state = (PoppetShelfState) shelf;
-        return record.id.equals(state.witcheryoptimizer$getShelfId())
-            && state.witcheryoptimizer$getDiskMirrorVersion() == record.removalSourceVersion
-            && record.customName.equals(state.witcheryoptimizer$getCustomName())
-            && inventoriesEqual(record.inventory, snapshot(shelf));
+        UUID id = state.witcheryoptimizer$getShelfId();
+        LocationResolution atTarget = resolveLocation(target);
+        return shelf.isInvalid() || atTarget.multiple
+            || data.isTombstonedLocation(target)
+            || state.witcheryoptimizer$hasPersistentShelfId() && (id == null || data.isTombstoned(id)
+                || data.get(id) != null && !data.get(id).location.equals(target)
+                || atTarget.record != null && !atTarget.record.id.equals(id));
     }
 
-    public void finalizeBreak(TileEntityPoppetShelf shelf) {
-        ShelfLocation target = location(shelf);
-        RemovalTransaction transaction = removal.get();
-        if ((transaction == null || !transaction.location.equals(target))
-            && !preRemove(shelf.getWorldObj(), shelf.xCoord, shelf.yCoord, shelf.zCoord))
-            throw new IllegalStateException("Poppet shelf break reached without a durable removal tombstone");
-        detach(shelf);
+    public ItemStack authoritativeRemovalStack(TileEntityPoppetShelf shelf, int slot) {
+        RemovalContext context = activeRemoval.get();
+        if (context != null && context.mode == RemovalMode.PHYSICAL_CLEANUP) return null;
+        if (!canServeRemovalSnapshot(context != null, context != null && context.shelf == shelf) || slot < 0
+            || slot >= context.inventory.length) return shelf.getStackInSlot(slot);
+        return context.inventory[slot];
+    }
+
+    public boolean beginWitcheryDrops(net.minecraft.world.World world, int x, int y, int z) {
+        RemovalContext context = exactContext(pendingRemoval.get(), world, x, y, z);
+        if (!canActivateRemoval(context != null, activeRemoval.get() != null)) return false;
+        activeRemoval.set(context);
+        return true;
+    }
+
+    public void finishWitcheryDrops(net.minecraft.world.World world, int x, int y, int z, boolean activated) {
+        if (!activated) return;
+        RemovalContext context = exactContext(activeRemoval.get(), world, x, y, z);
+        if (context == null) return;
+        activeRemoval.remove();
+        if (pendingRemoval.get() == context) pendingRemoval.remove();
+        detach(context.shelf);
+    }
+
+    public void finishSetBlock(net.minecraft.world.World world, int x, int y, int z, boolean succeeded) {
+        RemovalContext context = exactContext(pendingRemoval.get(), world, x, y, z);
+        if (!shouldClearPendingAtReturn(context != null)) return;
+        pendingRemoval.remove();
+        if (context.mode == RemovalMode.AUTHORITATIVE) WitcheryOptimizer.LOG.warn(
+            "Shelf authority was deleted but Witchery drop code was skipped at {}; drops will not replay",
+            context.location);
+        detach(context.shelf);
+    }
+
+    private RemovalContext exactContext(RemovalContext context, net.minecraft.world.World world, int x, int y, int z) {
+        if (context == null) return null;
+        ShelfLocation location = new ShelfLocation(world.provider.dimensionId, x, y, z);
+        return context.matches(world, location) ? context : null;
+    }
+
+    private boolean removalSuppressesShelf(TileEntityPoppetShelf shelf) {
+        RemovalContext pending = pendingRemoval.get();
+        RemovalContext active = activeRemoval.get();
+        return contextOwnsShelf(pending != null, pending == null ? null : pending.shelf, shelf)
+            || contextOwnsShelf(active != null, active == null ? null : active.shelf, shelf);
+    }
+
+    static boolean canBeginRemoval(boolean pending, boolean active) {
+        return !pending && !active;
+    }
+
+    static boolean canActivateRemoval(boolean exactPending, boolean active) {
+        return exactPending && !active;
+    }
+
+    static boolean shouldClearPendingAtReturn(boolean exactPending) {
+        return exactPending;
+    }
+
+    static boolean contextOwnsShelf(boolean contextPresent, Object owner, Object shelf) {
+        return contextPresent && owner == shelf;
+    }
+
+    static boolean canServeRemovalSnapshot(boolean active, boolean exactShelf) {
+        return active && exactShelf;
+    }
+
+    static boolean startupIdentityMatches(boolean persistent, UUID physical, UUID authoritative) {
+        return persistent && physical != null && physical.equals(authoritative);
+    }
+
+    static SetBlockRemoval classifyRemoval(boolean attached, boolean cleanupCandidate) {
+        if (attached) return SetBlockRemoval.AUTHORITATIVE;
+        return cleanupCandidate ? SetBlockRemoval.PHYSICAL_CLEANUP : SetBlockRemoval.TRANSIENT_FAILURE;
+    }
+
+    enum MissingTileRemoval {
+        CLEANUP,
+        DELETE_THEN_CLEANUP,
+        TRANSIENT_FAILURE
+    }
+
+    static MissingTileRemoval classifyMissingTileRemoval(boolean authorityAtTarget, boolean multipleAtTarget) {
+        if (multipleAtTarget) return MissingTileRemoval.TRANSIENT_FAILURE;
+        return authorityAtTarget ? MissingTileRemoval.DELETE_THEN_CLEANUP : MissingTileRemoval.CLEANUP;
+    }
+
+    private void clearStaleRemovalAtTick() {
+        RemovalContext stale = pendingRemoval.get();
+        if (stale == null) return;
+        pendingRemoval.remove();
+        WitcheryOptimizer.LOG.warn(
+            stale.mode == RemovalMode.AUTHORITATIVE
+                ? "Cleared interrupted at-most-once shelf removal at {}; drops will not replay"
+                : "Cleared interrupted physical shelf cleanup at {}; inventory remains quarantined",
+            stale.location);
+    }
+
+    static boolean deletionBeforeSpawn(boolean deletionDurable, boolean removalSucceeded) {
+        return deletionDurable && removalSucceeded;
+    }
+
+    private static ItemStack[] copyInventory(ItemStack[] source) {
+        ItemStack[] copy = new ItemStack[source.length];
+        for (int slot = 0; slot < source.length; slot++) copy[slot] = ShelfRecord.copy(source[slot]);
+        return copy;
     }
 
     public boolean releaseWitcheryTicket(TileEntityPoppetShelf shelf, Ticket ticket) {
+        if (startupValidation.get() != null) {
+            if (ticket != null) ForgeChunkManager.releaseTicket(ticket);
+            return true;
+        }
         if (!attach(shelf)) return false;
         if (ticket != null) ForgeChunkManager.releaseTicket(ticket);
         return true;
@@ -670,225 +576,6 @@ public final class PoppetRegistry {
         return attach((TileEntityPoppetShelf) tile);
     }
 
-    private void runCensus() {
-        int attempt = data.retryAttempt() + 1;
-        WitcheryOptimizer.LOG.info(
-            "Starting exhaustive shelf census: attempt={}, knownDimensions={}, authoritativeShelves={}",
-            attempt,
-            data.dimensionOrder()
-                .size(),
-            data.records()
-                .size());
-        try {
-            journal.appendCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.IN_PROGRESS);
-            data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.IN_PROGRESS);
-            importLoadedShelvesInObservedOrder();
-            ShelfCensus.Snapshot census = ShelfCensus
-                .scan(DimensionManager.getCurrentSaveRootDirectory(), data.dimensionOrder());
-            List<Integer> loadedPrefix = new ArrayList<>();
-            for (WorldServer world : orderedServerWorlds())
-                if (world != null) loadedPrefix.add(world.provider.dimensionId);
-            data.normalizeDimensionOrder(
-                deterministicDimensionOrder(loadedPrefix, data.dimensionOrder(), census.dimensions.keySet()));
-            rebuildAllowedDimensions();
-            Set<ShelfLocation> reconciledRemovals = reconcilePreparedRemovals(census);
-            for (ShelfCensus.Entry entry : census.entries) {
-                ShelfLocation location = new ShelfLocation(
-                    entry.dimension,
-                    entry.tile.getInteger("x"),
-                    entry.tile.getInteger("y"),
-                    entry.tile.getInteger("z"));
-                if (reconciledRemovals.contains(location)) continue;
-                data.observeDimension(entry.dimension);
-                LocationResolution existing = resolveLocation(location);
-                if (existing.multiple)
-                    throw new ShelfCensus.CensusException("Multiple authoritative records at " + location);
-                boolean uuidMost = entry.tile.hasKey("WOShelfUuidMost");
-                boolean uuidLeast = entry.tile.hasKey("WOShelfUuidLeast");
-                if (uuidMost != uuidLeast) throw new ShelfCensus.CensusException("Partial shelf UUID at " + location);
-                UUID physicalId = uuidMost
-                    ? new UUID(entry.tile.getLong("WOShelfUuidMost"), entry.tile.getLong("WOShelfUuidLeast"))
-                    : null;
-                if (existing.record != null) {
-                    if (!censusIdentityMatches(existing.record, physicalId, entry.tile))
-                        throw new ShelfCensus.CensusException("Census identity/content conflict at " + location);
-                    continue;
-                }
-                UUID id = physicalId == null ? UUID.randomUUID() : physicalId;
-                ShelfRecord byId = data.get(id);
-                if (byId != null && !byId.location.equals(location))
-                    throw new ShelfCensus.CensusException("Census found copied shelf UUID " + id + " at " + location);
-                ShelfRecord record = data
-                    .newRecord(id, location, entry.tile.getString("CustomName"), items(entry.tile));
-                journal.appendPost(record);
-                data.install(record);
-            }
-            if (data.hasCleanupPendingRemovals()) {
-                journal.appendCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.UNKNOWN);
-                data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.UNKNOWN);
-                return;
-            }
-            if (data.hasPreparedRemovals())
-                throw new ShelfCensus.CensusException("Unresolved prepared shelf removal remains");
-            verifyActiveRecords(census);
-            journal.appendCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.COMPLETE);
-            data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.COMPLETE);
-            data.markDirty();
-            WitcheryOptimizer.LOG.info(
-                "Shelf census complete: dimensions={}, physicalShelves={}, authoritativeShelves={}, pendingWritebacks={}",
-                census.dimensions.size(),
-                census.entries.size(),
-                data.records()
-                    .size(),
-                data.pendingWritebacks());
-        } catch (IOException | RuntimeException exception) {
-            boolean corruption = exception instanceof ShelfCensus.CensusException
-                && ((ShelfCensus.CensusException) exception).isCorruption();
-            long retryAt = System.currentTimeMillis() + RetryPolicy.delay(attempt, corruption);
-            String reason = exception.getClass()
-                .getSimpleName() + ": "
-                + String.valueOf(exception.getMessage());
-            if (reason.length() > 160) reason = reason.substring(0, 160);
-            try {
-                journal.appendCensusRetry(CENSUS_VERSION, attempt, retryAt, corruption, reason);
-            } catch (IOException persistence) {
-                exception.addSuppressed(persistence);
-            }
-            data.setCensusRetry(CENSUS_VERSION, attempt, retryAt, corruption, reason);
-            censusAttempted = false;
-            WitcheryOptimizer.LOG.error(
-                "Exhaustive shelf census failed; lookup remains fail-closed, class={}, attempt={}, retryAt={}",
-                corruption ? "corruption" : "transient",
-                attempt,
-                retryAt,
-                exception);
-        }
-
-    }
-
-    private void verifyActiveRecords(ShelfCensus.Snapshot census) throws IOException {
-        Set<UUID> disk = new HashSet<>();
-        for (ShelfCensus.Entry entry : census.entries) {
-            ShelfLocation location = new ShelfLocation(
-                entry.dimension,
-                entry.tile.getInteger("x"),
-                entry.tile.getInteger("y"),
-                entry.tile.getInteger("z"));
-            LocationResolution resolution = resolveLocation(location);
-            if (resolution.record != null && resolution.record.state == ShelfRecord.State.ACTIVE
-                && censusIdentityMatches(resolution.record, physicalId(entry.tile), entry.tile))
-                disk.add(resolution.record.id);
-        }
-        for (ShelfRecord record : data.records()) {
-            if (record.state != ShelfRecord.State.ACTIVE || disk.contains(record.id)) continue;
-            TileEntityPoppetShelf shelf = loaded.get(record.id);
-            if (!activeRecordProven(
-                record.state,
-                disk.contains(record.id),
-                shelf != null && !shelf.isInvalid()
-                    && location(shelf).equals(record.location)
-                    && record.id.equals(attached.get(shelf))))
-                throw new ShelfCensus.CensusException(
-                    "Active authoritative shelf has no physical proof at " + record.location);
-        }
-    }
-
-    static boolean activeRecordProven(ShelfRecord.State state, boolean exactDisk, boolean exactLoaded) {
-        return state != ShelfRecord.State.ACTIVE || exactDisk || exactLoaded;
-    }
-
-    private Set<ShelfLocation> reconcilePreparedRemovals(ShelfCensus.Snapshot census) throws IOException {
-        Map<ShelfLocation, ShelfCensus.Entry> physical = new HashMap<>();
-        for (ShelfCensus.Entry entry : census.entries) {
-            ShelfLocation location = new ShelfLocation(
-                entry.dimension,
-                entry.tile.getInteger("x"),
-                entry.tile.getInteger("y"),
-                entry.tile.getInteger("z"));
-            if (physical.put(location, entry) != null)
-                throw new ShelfCensus.CensusException("Multiple physical shelves at " + location);
-        }
-        Set<ShelfLocation> handled = new HashSet<>();
-        for (ShelfRecord record : data.records()) {
-            if (record.state != ShelfRecord.State.REMOVAL_PREPARED
-                && record.state != ShelfRecord.State.REMOVAL_CLEANUP_PENDING) continue;
-            ShelfCensus.Entry shelf = physical.get(record.location);
-            boolean exactShelf = shelf != null && preparedPhysicalMatches(record, shelf.tile);
-            ShelfCensus.DropEvidence drops = census.drops.get(record.removalTransaction);
-            boolean hasDrops = drops != null && !drops.isEmpty();
-            boolean completeDrops = drops != null && drops.completelyMatches(record.inventory);
-            RemovalRecovery recovery = removalRecovery(
-                shelf != null,
-                exactShelf,
-                record.removalDropsStarted,
-                hasDrops,
-                completeDrops);
-            if (recovery == RemovalRecovery.UNRESOLVED) throw new ShelfCensus.CensusException(
-                "Cannot safely reconcile prepared shelf removal at " + record.location);
-            if (recovery == RemovalRecovery.RESTORE) {
-                ShelfRecord restored = ShelfRecord.read(record.write());
-                restored.version++;
-                restored.state = ShelfRecord.State.ACTIVE;
-                restored.removalTransaction = null;
-                restored.writebackPending = true;
-                journal.appendPost(restored);
-                data.install(restored);
-            } else if (recovery == RemovalRecovery.DELETE) {
-                commitRemoval(record);
-            } else {
-                ShelfRecord cleanup = ShelfRecord.read(record.write());
-                cleanup.version++;
-                cleanup.state = ShelfRecord.State.REMOVAL_CLEANUP_PENDING;
-                journal.appendPost(cleanup);
-                data.install(cleanup);
-            }
-            handled.add(record.location);
-        }
-        return handled;
-    }
-
-    private static UUID physicalId(NBTTagCompound tile) throws IOException {
-        boolean most = tile.hasKey("WOShelfUuidMost");
-        boolean least = tile.hasKey("WOShelfUuidLeast");
-        if (most != least) throw new IOException("Partial physical shelf UUID");
-        return most ? new UUID(tile.getLong("WOShelfUuidMost"), tile.getLong("WOShelfUuidLeast")) : null;
-    }
-
-    static RemovalRecovery removalRecovery(boolean shelfPresent, boolean exactShelf, boolean dropsStarted,
-        boolean hasDrops, boolean completeDrops) {
-        if (shelfPresent && exactShelf && !hasDrops) return RemovalRecovery.RESTORE;
-        if (!shelfPresent && dropsStarted && completeDrops) return RemovalRecovery.DELETE;
-        if (shelfPresent && exactShelf && completeDrops) return RemovalRecovery.CLEANUP_PENDING;
-        return RemovalRecovery.UNRESOLVED;
-    }
-
-    static boolean preparedPhysicalMatches(ShelfRecord record, NBTTagCompound tile) throws IOException {
-        UUID id = physicalId(tile);
-        return id != null && id.equals(record.id)
-            && tile.hasKey("WOWritebackVersion")
-            && tile.getLong("WOWritebackVersion") == record.removalSourceVersion
-            && record.customName.equals(tile.getString("CustomName"))
-            && inventoriesEqual(record.inventory, items(tile));
-    }
-
-    private static boolean inventoriesEqual(ItemStack[] left, ItemStack[] right) {
-        for (int i = 0; i < left.length; i++) {
-            NBTTagCompound leftTag = new NBTTagCompound();
-            NBTTagCompound rightTag = new NBTTagCompound();
-            if (left[i] != null) left[i].writeToNBT(leftTag);
-            if (right[i] != null) right[i].writeToNBT(rightTag);
-            if (!leftTag.equals(rightTag)) return false;
-        }
-        return true;
-    }
-
-    enum RemovalRecovery {
-        RESTORE,
-        DELETE,
-        CLEANUP_PENDING,
-        UNRESOLVED
-    }
-
     private void importLoadedShelvesInObservedOrder() throws IOException {
         for (WorldServer world : orderedServerWorlds()) {
             if (world == null) continue;
@@ -912,8 +599,7 @@ public final class PoppetRegistry {
                     resolution.multiple,
                     duplicateLoaded,
                     id != null && data.isTombstoned(id)))
-                    throw new ShelfCensus.CensusException(
-                        "Loaded shelf has conflicting persistent authority at " + shelfLocation);
+                    throw new IOException("Loaded shelf has conflicting persistent authority at " + shelfLocation);
                 if (!attach(shelf)) throw new IOException(
                     "Loaded shelf reconciliation failed in dimension " + world.provider.dimensionId);
             }
@@ -962,7 +648,7 @@ public final class PoppetRegistry {
             || (data.importState() != PoppetWorldData.ImportState.COMPLETE
                 && data.importState() != PoppetWorldData.ImportState.DRAINED_CLEAN
                 && data.importState() != PoppetWorldData.ImportState.DRAINED_WITH_GAPS)
-            || !data.censusComplete(CENSUS_VERSION)) return null;
+            || !data.censusComplete(VALIDATION_VERSION)) return null;
         Set<UUID> visited = new HashSet<>();
         for (WorldServer world : orderedServerWorlds()) {
             if (world == null || !allowedDimensions.contains(world.provider.dimensionId)) continue;
@@ -1030,10 +716,6 @@ public final class PoppetRegistry {
         return new LocationResolution(found, false);
     }
 
-    static boolean shouldRestoreRemoval(boolean oldShelfBlock, boolean exactOriginalTile) {
-        return oldShelfBlock && exactOriginalTile;
-    }
-
     private static final class LocationResolution {
 
         final ShelfRecord record;
@@ -1045,80 +727,207 @@ public final class PoppetRegistry {
         }
     }
 
-    static boolean cleanupContextMatches(ShelfLocation expectedLocation, UUID expectedShelf, UUID expectedTransaction,
-        int actualDimension, int x, int y, int z, UUID actualShelf, UUID actualTransaction, boolean sameWorld,
-        boolean sameTile) {
-        return sameWorld && sameTile
-            && expectedLocation.equals(new ShelfLocation(actualDimension, x, y, z))
-            && expectedShelf.equals(actualShelf)
-            && expectedTransaction.equals(actualTransaction);
-    }
-
-    private static final class CleanupContext {
+    private static final class RemovalContext {
 
         final net.minecraft.world.World world;
         final ShelfLocation location;
-        final UUID shelfId;
-        final UUID transaction;
         final TileEntityPoppetShelf shelf;
+        final ItemStack[] inventory;
+        final RemovalMode mode;
 
-        CleanupContext(net.minecraft.world.World world, ShelfRecord record, TileEntityPoppetShelf shelf) {
-            this.world = world;
-            location = record.location;
-            shelfId = record.id;
-            transaction = record.removalTransaction;
-            this.shelf = shelf;
-        }
-
-        boolean matches(net.minecraft.world.World candidateWorld, int x, int y, int z, TileEntity candidateTile) {
-            UUID actualId = candidateTile instanceof PoppetShelfState
-                ? ((PoppetShelfState) candidateTile).witcheryoptimizer$getShelfId()
-                : null;
-            return actualId != null && cleanupContextMatches(
-                location,
-                shelfId,
-                transaction,
-                candidateWorld.provider.dimensionId,
-                x,
-                y,
-                z,
-                actualId,
-                transaction,
-                world == candidateWorld,
-                shelf == candidateTile);
-        }
-    }
-
-    private static final class RemovalTransaction {
-
-        final net.minecraft.world.World world;
-        final ShelfLocation location;
-        final ShelfRecord before;
-        final TileEntityPoppetShelf shelf;
-        final UUID transaction;
-        int nextDrop;
-
-        RemovalTransaction(net.minecraft.world.World world, ShelfLocation location, ShelfRecord before,
-            TileEntityPoppetShelf shelf, UUID transaction) {
+        RemovalContext(net.minecraft.world.World world, ShelfLocation location, TileEntityPoppetShelf shelf,
+            ItemStack[] inventory, RemovalMode mode) {
             this.world = world;
             this.location = location;
-            this.before = before;
             this.shelf = shelf;
-            this.transaction = transaction;
+            this.inventory = inventory;
+            this.mode = mode;
         }
 
-        boolean matchesWorld(net.minecraft.world.World candidate) {
-            return world == candidate;
+        static RemovalContext authoritative(net.minecraft.world.World world, ShelfLocation location,
+            TileEntityPoppetShelf shelf, ItemStack[] inventory) {
+            return new RemovalContext(world, location, shelf, inventory, RemovalMode.AUTHORITATIVE);
+        }
+
+        static RemovalContext cleanup(net.minecraft.world.World world, ShelfLocation location,
+            TileEntityPoppetShelf shelf) {
+            return new RemovalContext(world, location, shelf, new ItemStack[0], RemovalMode.PHYSICAL_CLEANUP);
         }
 
         boolean matches(net.minecraft.world.World candidate, ShelfLocation target) {
-            return transactionContextMatches(world == candidate, location, target);
+            return world == candidate && location.equals(target);
         }
     }
 
     public interface Matcher {
 
         ItemStack find(EntityPlayer player, IInventory inventory);
+    }
+
+    private void validateAuthorities() throws IOException {
+        List<ShelfRecord> candidates = new ArrayList<>(data.records());
+        int validated = 0;
+        int deleted = 0;
+        WitcheryOptimizer.LOG.info("Starting startup authority validation: records={}", candidates.size());
+        journal.appendCensusState(VALIDATION_VERSION, PoppetWorldData.CensusState.IN_PROGRESS);
+        data.setCensusState(VALIDATION_VERSION, PoppetWorldData.CensusState.IN_PROGRESS);
+        for (ShelfRecord record : candidates) {
+            if (record.state != ShelfRecord.State.ACTIVE) {
+                long generation = record.version + 1;
+                journal.appendDelete(record, generation);
+                data.delete(record.id, generation, record.location, record.removalTransaction);
+                deleted++;
+                WitcheryOptimizer.LOG
+                    .warn("Tombstoned legacy interrupted removal at {}: no drops will be replayed", record.location);
+                continue;
+            }
+            String failure = validateAuthority(record);
+            if (failure == null) {
+                validated++;
+                continue;
+            }
+            long generation = record.version + 1;
+            journal.appendDelete(record, generation);
+            data.delete(record.id, generation, record.location, record.removalTransaction);
+            deleted++;
+            WitcheryOptimizer.LOG.warn(
+                "Deleted startup shelf authority at {} (dimension {}): {}",
+                record.location,
+                record.location.dimension,
+                failure);
+        }
+        journal.appendCensusState(VALIDATION_VERSION, PoppetWorldData.CensusState.COMPLETE);
+        data.setCensusState(VALIDATION_VERSION, PoppetWorldData.CensusState.COMPLETE);
+        WitcheryOptimizer.LOG
+            .info("Startup authority validation complete: validated={}, deleted={}, pending=0", validated, deleted);
+    }
+
+    private String validateAuthority(ShelfRecord record) throws IOException {
+        int dimension = record.location.dimension;
+        if (!DimensionManager.isDimensionRegistered(dimension))
+            throw new IOException("Authority dimension " + dimension + " is not currently registered");
+        WorldServer world = DimensionManager.getWorld(dimension);
+        boolean worldWasLoaded = world != null;
+        if (world == null) {
+            DimensionManager.initDimension(dimension);
+            world = DimensionManager.getWorld(dimension);
+        }
+        if (world == null) throw new IOException("Registered dimension " + dimension + " could not be initialized");
+        int chunkX = record.location.x >> 4;
+        int chunkZ = record.location.z >> 4;
+        boolean chunkWasLoaded = world.theChunkProviderServer.chunkExists(chunkX, chunkZ);
+        if (!chunkWasLoaded) {
+            if (!(world.theChunkProviderServer.currentChunkLoader instanceof AnvilChunkLoader))
+                throw new IOException("Authority validation requires an observable Anvil chunk loader");
+            try {
+                if (!((AnvilChunkLoader) world.theChunkProviderServer.currentChunkLoader)
+                    .chunkExists(world, chunkX, chunkZ))
+                    throw new IOException("Authority validation found no persisted exact chunk");
+            } catch (RuntimeException exception) {
+                throw new IOException("Authority validation persisted chunk existence check failed", exception);
+            }
+        }
+        Throwable operationalFailure = null;
+        startupValidation.set(record);
+        startupDiskLoad.set(new DiskLoadObservation(world, chunkX, chunkZ));
+        try {
+            if (world.theChunkProviderServer.loadChunk(chunkX, chunkZ) == null)
+                throw new IOException("Authority validation chunk load returned null");
+            DiskLoadObservation diskLoad = startupDiskLoad.get();
+            boolean diskProven = !chunkWasLoaded && diskLoad != null && diskLoad.observed && diskLoad.loaded;
+            if (!chunkWasLoaded && !diskProven)
+                throw new IOException("Authority validation could not prove a successful exact disk chunk load");
+            boolean exactBlock = world.getBlock(record.location.x, record.location.y, record.location.z)
+                == com.emoniph.witchery.Witchery.Blocks.POPPET_SHELF;
+            TileEntity tile = world.getTileEntity(record.location.x, record.location.y, record.location.z);
+            boolean exactTile = tile instanceof TileEntityPoppetShelf;
+            boolean exactIdentity = exactTile && startupIdentityMatches(
+                ((PoppetShelfState) tile).witcheryoptimizer$hasPersistentShelfId(),
+                ((PoppetShelfState) tile).witcheryoptimizer$getShelfId(),
+                record.id);
+            StartupValidationDecision decision = classifyPhysicalValidation(
+                chunkWasLoaded,
+                diskProven,
+                exactBlock,
+                exactTile,
+                exactIdentity);
+            if (decision == StartupValidationDecision.RETRY)
+                throw new IOException("Preloaded authority chunk has no disk provenance for physical mismatch");
+            if (decision == StartupValidationDecision.DELETE)
+                return startupValidationConfirmedAbsence(exactBlock, exactTile, exactIdentity);
+            TileEntityPoppetShelf shelf = (TileEntityPoppetShelf) tile;
+            mirror(record, shelf);
+            attached.put(shelf, record.id);
+            loaded.put(record.id, shelf);
+            synchronizing.set(true);
+            try {
+                shelf.markDirty();
+            } finally {
+                synchronizing.remove();
+            }
+            return null;
+        } catch (IOException | RuntimeException exception) {
+            operationalFailure = exception;
+            throw exception;
+        } finally {
+            startupValidation.remove();
+            startupDiskLoad.remove();
+            if (!chunkWasLoaded) {
+                try {
+                    world.theChunkProviderServer.unloadChunksIfNotNearSpawn(chunkX, chunkZ);
+                } catch (RuntimeException unloadFailure) {
+                    if (operationalFailure != null) operationalFailure.addSuppressed(unloadFailure);
+                    else throw unloadFailure;
+                }
+            }
+            if (!worldWasLoaded)
+                WitcheryOptimizer.LOG.debug("Temporarily loaded dimension {} for authority validation", dimension);
+        }
+    }
+
+    static String startupValidationConfirmedAbsence(boolean exactBlock, boolean exactTile, boolean exactIdentity) {
+        if (!exactBlock) return "exact Witchery Poppet Shelf is absent";
+        if (!exactTile) return "exact Witchery Poppet Shelf TE is absent";
+        return exactIdentity ? null : "exact shelf identity does not match authority";
+    }
+
+    static StartupValidationDecision classifyStartupValidation(boolean registered, boolean worldResolved,
+        boolean chunkLoaded, boolean diskLoadProven, boolean exactBlock, boolean exactTile, boolean exactIdentity) {
+        if (!registered || !worldResolved || !chunkLoaded) return StartupValidationDecision.RETRY;
+        return classifyPhysicalValidation(false, diskLoadProven, exactBlock, exactTile, exactIdentity);
+    }
+
+    static StartupValidationDecision classifyPhysicalValidation(boolean preloaded, boolean diskProven,
+        boolean exactBlock, boolean exactTile, boolean exactIdentity) {
+        if (exactBlock && exactTile && exactIdentity) return StartupValidationDecision.MIRROR;
+        return !preloaded && diskProven ? StartupValidationDecision.DELETE : StartupValidationDecision.RETRY;
+    }
+
+    public void observeStartupDiskLoad(net.minecraft.world.World world, int chunkX, int chunkZ, boolean loaded) {
+        DiskLoadObservation observation = startupDiskLoad.get();
+        if (observation != null && observation.matches(world, chunkX, chunkZ)) {
+            observation.observed = true;
+            observation.loaded = loaded;
+        }
+    }
+
+    private static final class DiskLoadObservation {
+
+        final net.minecraft.world.World world;
+        final int chunkX;
+        final int chunkZ;
+        boolean observed;
+        boolean loaded;
+
+        DiskLoadObservation(net.minecraft.world.World world, int chunkX, int chunkZ) {
+            this.world = world;
+            this.chunkX = chunkX;
+            this.chunkZ = chunkZ;
+        }
+
+        boolean matches(net.minecraft.world.World candidate, int x, int z) {
+            return world == candidate && chunkX == x && chunkZ == z;
+        }
     }
 
     private synchronized boolean initialize() {
@@ -1146,30 +955,18 @@ public final class PoppetRegistry {
                 data.setImportState(PoppetWorldData.ImportState.DRAINED_WITH_GAPS);
                 importCoordinator.resume(PoppetWorldData.ImportState.DRAINED_WITH_GAPS);
             }
-            if (data.censusState() == PoppetWorldData.CensusState.IN_PROGRESS
-                || data.censusState() == PoppetWorldData.CensusState.FAILED) {
-                long at = System.currentTimeMillis() + RetryPolicy.TRANSIENT_BASE;
-                journal.appendCensusRetry(CENSUS_VERSION, 1, at, false, "Interrupted census");
-                data.setCensusRetry(CENSUS_VERSION, 1, at, false, "Interrupted census");
-            }
-            if (requiresRemovalCensus(data.censusComplete(CENSUS_VERSION), data.hasPreparedRemovals())) {
-                journal.appendCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.UNKNOWN);
-                data.setCensusState(CENSUS_VERSION, PoppetWorldData.CensusState.UNKNOWN);
-            }
+            if (!data.censusComplete(VALIDATION_VERSION)) validateAuthorities();
             rebuildAllowedDimensions();
             initializationAttempts = 0;
             WitcheryOptimizer.LOG.info(
-                "Witchery Optimizer initialized: importState={}, censusState={}, authoritativeShelves={}, dimensions={}, pendingWritebacks={}, retryAttempt={}, retryAt={}, retryReason={}",
+                "Witchery Optimizer initialized: importState={}, validationState={}, authoritativeShelves={}, dimensions={}, pendingWritebacks={}",
                 data.importState(),
                 data.censusState(),
                 data.records()
                     .size(),
                 data.dimensionOrder()
                     .size(),
-                data.pendingWritebacks(),
-                data.retryAttempt(),
-                data.retryAt(System.currentTimeMillis()),
-                data.retryReason());
+                data.pendingWritebacks());
             return true;
         } catch (IOException | RuntimeException exception) {
             WitcheryOptimizer.LOG.error("Witchery Optimizer storage initialization failed closed", exception);

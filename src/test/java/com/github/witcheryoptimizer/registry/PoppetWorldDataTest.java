@@ -13,6 +13,41 @@ import com.github.witcheryoptimizer.migration.WitcheryImportCoordinator;
 public class PoppetWorldDataTest {
 
     @Test
+    public void strictLocationRejectsWrongTypesAndHeightBounds() {
+        NBTTagCompound tag = new ShelfLocation(0, 1, 0, 2).write();
+        for (int y : new int[] { -1, 256 }) {
+            tag.setInteger("Y", y);
+            try {
+                ShelfLocation.read(tag);
+                fail("invalid height accepted");
+            } catch (IllegalStateException expected) {}
+        }
+        tag.setInteger("Y", 255);
+        assertEquals(255, ShelfLocation.read(tag).y);
+        tag.setLong("X", 1);
+        try {
+            ShelfLocation.read(tag);
+            fail("long coordinate accepted");
+        } catch (IllegalStateException expected) {}
+    }
+
+    @Test
+    public void strictRecordRejectsDuplicateSlotsAndPartialUuid() {
+        ShelfRecord record = new ShelfRecord(
+            UUID.randomUUID(),
+            new ShelfLocation(0, 1, 2, 3),
+            "",
+            0,
+            new net.minecraft.item.ItemStack[9]);
+        NBTTagCompound tag = record.write();
+        tag.removeTag("UuidLeast");
+        try {
+            ShelfRecord.read(tag);
+            fail("partial UUID accepted");
+        } catch (IllegalStateException expected) {}
+    }
+
+    @Test
     public void firstEndTickCompletesTicketFreeUnknownBeforeCensusEligibility() {
         WitcheryImportCoordinator coordinator = new WitcheryImportCoordinator();
         PoppetWorldData.ImportState persisted = PoppetWorldData.ImportState.UNKNOWN;
@@ -60,6 +95,13 @@ public class PoppetWorldDataTest {
     public void preparedRemovalCannotAttachRegardlessOfPersistentIdentity() {
         assertFalse(PoppetRegistry.canAttach(ShelfRecord.State.REMOVAL_PREPARED));
         assertTrue(PoppetRegistry.canAttach(ShelfRecord.State.ACTIVE));
+    }
+
+    @Test
+    public void startupValidationQuarantinesBothRemovalStates() {
+        assertTrue(PoppetRegistry.quarantineDuringStartupValidation(ShelfRecord.State.REMOVAL_PREPARED));
+        assertTrue(PoppetRegistry.quarantineDuringStartupValidation(ShelfRecord.State.REMOVAL_CLEANUP_PENDING));
+        assertFalse(PoppetRegistry.quarantineDuringStartupValidation(ShelfRecord.State.ACTIVE));
     }
 
     @Test
@@ -142,14 +184,6 @@ public class PoppetWorldDataTest {
         assertEquals(PoppetWorldData.ImportState.IN_PROGRESS, restored.importState());
         restored.setImportState(PoppetWorldData.ImportState.FAILED);
         assertEquals(PoppetWorldData.ImportState.FAILED, restored.importState());
-    }
-
-    @Test
-    public void removalRollbackRequiresExactOriginalShelf() {
-        assertTrue(PoppetRegistry.shouldRestoreRemoval(true, true));
-        assertFalse(PoppetRegistry.shouldRestoreRemoval(false, true));
-        assertFalse(PoppetRegistry.shouldRestoreRemoval(true, false));
-        assertFalse(PoppetRegistry.shouldRestoreRemoval(false, false));
     }
 
     @Test
@@ -338,22 +372,6 @@ public class PoppetWorldDataTest {
     }
 
     @Test
-    public void removalOutcomeUsesPhysicalResultNotBooleanReturn() {
-        assertEquals(
-            PoppetRegistry.RemovalOutcome.COMMIT_AND_UNLOCK,
-            PoppetRegistry.removalOutcome(false, false, true));
-        assertEquals(
-            PoppetRegistry.RemovalOutcome.AWAIT_DURABLE_RECONCILIATION,
-            PoppetRegistry.removalOutcome(true, false, true));
-        assertEquals(
-            PoppetRegistry.RemovalOutcome.RESTORE_EXACT_ORIGINAL,
-            PoppetRegistry.removalOutcome(true, true, false));
-        assertEquals(
-            PoppetRegistry.RemovalOutcome.AWAIT_DURABLE_RECONCILIATION,
-            PoppetRegistry.removalOutcome(true, true, true));
-    }
-
-    @Test
     public void dynamicDimensionAllowancePreservesNumericRestriction() {
         java.util.List<Integer> dimensions = java.util.Arrays.asList(0, -1, 1, 7, 42);
         assertEquals(new java.util.HashSet<>(dimensions), PoppetRegistry.allowedDimensions(dimensions, false, 42));
@@ -445,28 +463,6 @@ public class PoppetWorldDataTest {
     }
 
     @Test
-    public void preparedRecoveryCoversAllCrashBoundariesAndReplayDecision() {
-        assertEquals(
-            PoppetRegistry.RemovalRecovery.RESTORE,
-            PoppetRegistry.removalRecovery(true, true, false, false, false));
-        assertEquals(
-            PoppetRegistry.RemovalRecovery.DELETE,
-            PoppetRegistry.removalRecovery(false, false, true, true, true));
-        assertEquals(
-            PoppetRegistry.RemovalRecovery.CLEANUP_PENDING,
-            PoppetRegistry.removalRecovery(true, true, true, true, true));
-        assertEquals(
-            PoppetRegistry.RemovalRecovery.UNRESOLVED,
-            PoppetRegistry.removalRecovery(false, false, true, true, false));
-        assertEquals(
-            PoppetRegistry.RemovalRecovery.RESTORE,
-            PoppetRegistry.removalRecovery(true, true, true, false, false));
-        assertEquals(
-            PoppetRegistry.RemovalRecovery.RESTORE,
-            PoppetRegistry.removalRecovery(true, true, false, false, false));
-    }
-
-    @Test
     public void preparedTransactionEvidenceRoundTripsAndLegacyPreparedFailsClosed() {
         ShelfRecord record = new ShelfRecord(
             UUID.randomUUID(),
@@ -515,38 +511,6 @@ public class PoppetWorldDataTest {
     }
 
     @Test
-    public void terminalRemovalPersistsCommittedTransactionForDropUnlock() {
-        PoppetWorldData data = new PoppetWorldData();
-        UUID transaction = UUID.randomUUID();
-        ShelfRecord record = data
-            .newRecord(UUID.randomUUID(), new ShelfLocation(0, 1, 2, 3), "", new net.minecraft.item.ItemStack[9]);
-        record.state = ShelfRecord.State.REMOVAL_PREPARED;
-        record.removalTransaction = transaction;
-        data.install(record);
-        data.delete(record.id, 2, record.location, transaction);
-        assertTrue(data.isCommittedRemoval(transaction));
-        NBTTagCompound root = new NBTTagCompound();
-        data.writeToNBT(root);
-        PoppetWorldData restored = new PoppetWorldData();
-        restored.readFromNBT(root);
-        assertTrue(restored.isCommittedRemoval(transaction));
-    }
-
-    @Test
-    public void removalDropTagParsingLocksOnlyCompleteOptimizerTransactions() {
-        NBTTagCompound ordinary = new NBTTagCompound();
-        assertNull(PoppetRegistry.removalDropTransaction(ordinary));
-        UUID transaction = UUID.randomUUID();
-        NBTTagCompound tagged = new NBTTagCompound();
-        tagged.setLong("WORemovalMost", transaction.getMostSignificantBits());
-        tagged.setLong("WORemovalLeast", transaction.getLeastSignificantBits());
-        tagged.setInteger("WODropOrdinal", 0);
-        assertEquals(transaction, PoppetRegistry.removalDropTransaction(tagged));
-        tagged.removeTag("WODropOrdinal");
-        assertEquals(new UUID(0, 0), PoppetRegistry.removalDropTransaction(tagged));
-    }
-
-    @Test
     public void cleanupPendingRoundTripsAndBlocksCompletionUntilDeleted() {
         PoppetWorldData data = new PoppetWorldData();
         ShelfRecord record = data
@@ -563,77 +527,147 @@ public class PoppetWorldDataTest {
         assertFalse(restored.hasCleanupPendingRemovals());
     }
 
-    @Test
-    public void cleanupAuthorizationRequiresExactWorldLocationShelfTransactionAndTile() {
-        ShelfLocation location = new ShelfLocation(7, 1, 2, 3);
-        UUID shelf = UUID.randomUUID();
-        UUID transaction = UUID.randomUUID();
-        assertTrue(
-            PoppetRegistry
-                .cleanupContextMatches(location, shelf, transaction, 7, 1, 2, 3, shelf, transaction, true, true));
-        assertFalse(
-            PoppetRegistry
-                .cleanupContextMatches(location, shelf, transaction, 7, 2, 2, 3, shelf, transaction, true, true));
-        assertFalse(
-            PoppetRegistry
-                .cleanupContextMatches(location, shelf, transaction, 7, 1, 2, 3, shelf, transaction, false, true));
-        assertFalse(
-            PoppetRegistry.cleanupContextMatches(
-                location,
-                shelf,
-                transaction,
-                7,
-                1,
-                2,
-                3,
-                UUID.randomUUID(),
-                transaction,
-                true,
-                true));
-        assertFalse(
-            PoppetRegistry
-                .cleanupContextMatches(location, shelf, transaction, 7, 1, 2, 3, shelf, UUID.randomUUID(), true, true));
-        assertFalse(
-            PoppetRegistry
-                .cleanupContextMatches(location, shelf, transaction, 7, 1, 2, 3, shelf, transaction, true, false));
-    }
-
-    @Test
-    public void cleanupAuthorizationDoesNotChangeOrdinaryRemovalDecision() {
-        assertEquals(
-            PoppetRegistry.RemovalOutcome.COMMIT_AND_UNLOCK,
-            PoppetRegistry.removalOutcome(false, false, true));
-        assertEquals(
-            PoppetRegistry.RemovalRecovery.CLEANUP_PENDING,
-            PoppetRegistry.removalRecovery(true, true, true, true, true));
-    }
-
-    @Test
-    public void existingRemovalTransactionAlwaysDeniesReuse() {
-        assertTrue(PoppetRegistry.allowNewRemoval(false));
-        assertFalse(PoppetRegistry.allowNewRemoval(true));
-        assertFalse(PoppetRegistry.shouldClearStaleAtTick(false));
-        assertTrue(PoppetRegistry.shouldClearStaleAtTick(true));
-        ShelfLocation same = new ShelfLocation(0, 1, 2, 3);
-        ShelfLocation different = new ShelfLocation(0, 2, 2, 3);
-        assertTrue(PoppetRegistry.transactionContextMatches(true, same, same));
-        assertFalse(PoppetRegistry.transactionContextMatches(true, same, different));
-        assertFalse(PoppetRegistry.transactionContextMatches(false, same, same));
-    }
-
-    @Test
-    public void crossWorldSpawnAndFinishContextsCannotMatch() {
-        ShelfLocation target = new ShelfLocation(7, 4, 5, 6);
-        assertFalse(PoppetRegistry.transactionContextMatches(false, target, target));
-        assertFalse(PoppetRegistry.transactionContextMatches(true, target, new ShelfLocation(8, 4, 5, 6)));
-        assertTrue(PoppetRegistry.requiresRemovalCensus(true, true));
-    }
-
     private static NBTTagCompound operation(UUID id, String kind) {
         NBTTagCompound operation = new NBTTagCompound();
         operation.setLong("OperationMost", id.getMostSignificantBits());
         operation.setLong("OperationLeast", id.getLeastSignificantBits());
         operation.setString("Kind", kind);
         return operation;
+    }
+
+    @Test
+    public void atMostOnceDropsRequireDurableDeletionAndSuccessfulRemoval() {
+        assertFalse(PoppetRegistry.deletionBeforeSpawn(false, true));
+        assertFalse(PoppetRegistry.deletionBeforeSpawn(true, false));
+        assertTrue(PoppetRegistry.deletionBeforeSpawn(true, true));
+    }
+
+    @Test
+    public void removalSuppressionAndSnapshotServingRequireExactShelf() {
+        Object shelf = new Object();
+        Object unrelated = new Object();
+        assertTrue(PoppetRegistry.contextOwnsShelf(true, shelf, shelf));
+        assertFalse(PoppetRegistry.contextOwnsShelf(false, shelf, shelf));
+        assertFalse(PoppetRegistry.contextOwnsShelf(true, shelf, unrelated));
+        assertTrue(PoppetRegistry.canServeRemovalSnapshot(true, true));
+        assertFalse(PoppetRegistry.canServeRemovalSnapshot(false, true));
+        assertFalse(PoppetRegistry.canServeRemovalSnapshot(true, false));
+    }
+
+    @Test
+    public void removalStateRejectsNestedPreflightAndActivatesOnlyExactPending() {
+        assertTrue(PoppetRegistry.canBeginRemoval(false, false));
+        assertFalse(PoppetRegistry.canBeginRemoval(true, false));
+        assertFalse(PoppetRegistry.canBeginRemoval(false, true));
+        assertFalse(PoppetRegistry.canBeginRemoval(true, true));
+        assertTrue(PoppetRegistry.canActivateRemoval(true, false));
+        assertFalse(PoppetRegistry.canActivateRemoval(false, false));
+        assertFalse(PoppetRegistry.canActivateRemoval(true, true));
+        assertTrue(PoppetRegistry.shouldClearPendingAtReturn(true));
+        assertFalse(PoppetRegistry.shouldClearPendingAtReturn(false));
+    }
+
+    @Test
+    public void startupValidationDeletesOnlyAfterLoadedPhysicalEvidence() {
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.RETRY,
+            PoppetRegistry.classifyStartupValidation(false, false, false, false, false, false, false));
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.RETRY,
+            PoppetRegistry.classifyStartupValidation(true, false, false, false, false, false, false));
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.RETRY,
+            PoppetRegistry.classifyStartupValidation(true, true, false, false, false, false, false));
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.RETRY,
+            PoppetRegistry.classifyStartupValidation(true, true, true, false, false, false, false));
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.DELETE,
+            PoppetRegistry.classifyStartupValidation(true, true, true, true, false, false, false));
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.DELETE,
+            PoppetRegistry.classifyStartupValidation(true, true, true, true, true, false, false));
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.DELETE,
+            PoppetRegistry.classifyStartupValidation(true, true, true, true, true, true, false));
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.MIRROR,
+            PoppetRegistry.classifyStartupValidation(true, true, true, true, true, true, true));
+        assertEquals(
+            "exact Witchery Poppet Shelf is absent",
+            PoppetRegistry.startupValidationConfirmedAbsence(false, false, false));
+        assertEquals(
+            "exact Witchery Poppet Shelf TE is absent",
+            PoppetRegistry.startupValidationConfirmedAbsence(true, false, false));
+        assertEquals(
+            "exact shelf identity does not match authority",
+            PoppetRegistry.startupValidationConfirmedAbsence(true, true, false));
+        assertNull(PoppetRegistry.startupValidationConfirmedAbsence(true, true, true));
+    }
+
+    @Test
+    public void preloadedChunkMismatchRetriesWithoutDiskProvenance() {
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.MIRROR,
+            PoppetRegistry.classifyPhysicalValidation(true, false, true, true, true));
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.RETRY,
+            PoppetRegistry.classifyPhysicalValidation(true, false, false, false, false));
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.RETRY,
+            PoppetRegistry.classifyPhysicalValidation(true, false, true, true, false));
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.DELETE,
+            PoppetRegistry.classifyPhysicalValidation(false, true, false, false, false));
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.DELETE,
+            PoppetRegistry.classifyPhysicalValidation(false, true, true, true, false));
+        assertEquals(
+            PoppetRegistry.StartupValidationDecision.RETRY,
+            PoppetRegistry.classifyPhysicalValidation(false, false, false, false, false));
+    }
+
+    @Test
+    public void startupMirrorRequiresExactPersistentPhysicalIdentity() {
+        UUID authority = UUID.randomUUID();
+        assertTrue(PoppetRegistry.startupIdentityMatches(true, authority, authority));
+        assertFalse(PoppetRegistry.startupIdentityMatches(false, authority, authority));
+        assertFalse(PoppetRegistry.startupIdentityMatches(true, null, authority));
+        assertFalse(PoppetRegistry.startupIdentityMatches(true, UUID.randomUUID(), authority));
+    }
+
+    @Test
+    public void removalOutcomeMatrixSeparatesCleanupFromTransientFailure() {
+        assertEquals(PoppetRegistry.SetBlockRemoval.AUTHORITATIVE, PoppetRegistry.classifyRemoval(true, false));
+        assertEquals(PoppetRegistry.SetBlockRemoval.PHYSICAL_CLEANUP, PoppetRegistry.classifyRemoval(false, true));
+        assertEquals(PoppetRegistry.SetBlockRemoval.TRANSIENT_FAILURE, PoppetRegistry.classifyRemoval(false, false));
+    }
+
+    @Test
+    public void missingTileRemovalRequiresUniqueAuthorityDeletionBeforeCleanup() {
+        assertEquals(
+            PoppetRegistry.MissingTileRemoval.CLEANUP,
+            PoppetRegistry.classifyMissingTileRemoval(false, false));
+        assertEquals(
+            PoppetRegistry.MissingTileRemoval.DELETE_THEN_CLEANUP,
+            PoppetRegistry.classifyMissingTileRemoval(true, false));
+        assertEquals(
+            PoppetRegistry.MissingTileRemoval.TRANSIENT_FAILURE,
+            PoppetRegistry.classifyMissingTileRemoval(false, true));
+        assertEquals(
+            PoppetRegistry.MissingTileRemoval.TRANSIENT_FAILURE,
+            PoppetRegistry.classifyMissingTileRemoval(true, true));
+    }
+
+    @Test
+    public void staleAuthorityDeleteLeavesNoGhostRecord() {
+        PoppetWorldData data = new PoppetWorldData();
+        ShelfRecord record = data
+            .newRecord(UUID.randomUUID(), new ShelfLocation(0, 12, 64, 13), "", new net.minecraft.item.ItemStack[9]);
+        data.install(record);
+        data.delete(record.id, record.version + 1, record.location);
+        assertNull(data.get(record.id));
+        assertTrue(data.isTombstoned(record.id));
+        assertTrue(data.isTombstonedLocation(record.location));
     }
 }

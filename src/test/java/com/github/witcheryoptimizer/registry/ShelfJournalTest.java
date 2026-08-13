@@ -7,6 +7,9 @@ import java.nio.file.Files;
 import java.util.UUID;
 
 import net.minecraft.item.ItemStack;
+import net.minecraft.nbt.CompressedStreamTools;
+import net.minecraft.nbt.NBTTagCompound;
+import net.minecraft.nbt.NBTTagList;
 
 import org.junit.Test;
 
@@ -152,6 +155,58 @@ public class ShelfJournalTest {
             PoppetWorldData data = new PoppetWorldData();
             new ShelfJournal(directory).recover(data);
             assertEquals(PoppetWorldData.CensusState.IN_PROGRESS, data.censusState());
+        } finally {
+            delete(directory);
+        }
+
+    }
+
+    @Test
+    public void wrongEntriesTypeCannotHideDelete() throws Exception {
+        assertMalformedRoot(root -> root.setString("Entries", "hidden"));
+    }
+
+    @Test
+    public void missingEntriesFailsClosed() throws Exception {
+        assertMalformedRoot(root -> root.removeTag("Entries"));
+    }
+
+    @Test
+    public void negativeSequenceFailsClosed() throws Exception {
+        assertMalformedRoot(root -> root.setLong("Sequence", -1));
+    }
+
+    @Test
+    public void malformedDeletePayloadFailsClosed() throws Exception {
+        assertMalformedRoot(root -> {
+            NBTTagCompound operation = new NBTTagCompound();
+            operation.setString("Kind", "DELETE");
+            operation.setLong("ShelfMost", 1);
+            operation.setLong("ShelfLeast", 2);
+            operation.setString("Generation", "not-a-long");
+            NBTTagList entries = new NBTTagList();
+            entries.appendTag(operation);
+            root.setTag("Entries", entries);
+        });
+    }
+
+    private static void assertMalformedRoot(java.util.function.Consumer<NBTTagCompound> corrupt) throws Exception {
+        File directory = Files.createTempDirectory("wo-malformed-")
+            .toFile();
+        try {
+            NBTTagCompound root = new NBTTagCompound();
+            root.setInteger("Schema", PoppetWorldData.SCHEMA);
+            root.setLong("Sequence", 1);
+            root.setTag("Entries", new NBTTagList());
+            corrupt.accept(root);
+            try (java.io.FileOutputStream output = new java.io.FileOutputStream(
+                new File(directory, "witcheryoptimizer-journal.dat"))) {
+                CompressedStreamTools.writeCompressed(root, output);
+            }
+            try {
+                new ShelfJournal(directory);
+                fail("malformed WAL root must fail closed");
+            } catch (java.io.IOException expected) {}
         } finally {
             delete(directory);
         }

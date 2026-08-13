@@ -26,11 +26,18 @@ public final class ShelfLocation implements Comparable<ShelfLocation> {
     }
 
     public static ShelfLocation read(NBTTagCompound tag) {
-        return new ShelfLocation(
+        StrictNbt.require(tag, "Dimension", 3);
+        StrictNbt.require(tag, "X", 3);
+        StrictNbt.require(tag, "Y", 3);
+        StrictNbt.require(tag, "Z", 3);
+        ShelfLocation location = new ShelfLocation(
             tag.getInteger("Dimension"),
             tag.getInteger("X"),
             tag.getInteger("Y"),
             tag.getInteger("Z"));
+        if (location.y < 0 || location.y > 255)
+            throw new IllegalStateException("Shelf Y outside 0..255: " + location.y);
+        return location;
     }
 
     @Override

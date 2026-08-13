@@ -67,38 +67,60 @@ final class ShelfRecord {
     }
 
     static ShelfRecord read(NBTTagCompound tag) {
+        StrictNbt.require(tag, "UuidMost", 4);
+        StrictNbt.require(tag, "UuidLeast", 4);
+        StrictNbt.require(tag, "Location", 10);
+        StrictNbt.require(tag, "State", 8);
+        StrictNbt.require(tag, "WritebackPending", 1);
+        if (tag.hasKey("CustomName")) StrictNbt.require(tag, "CustomName", 8);
         ItemStack[] inventory = new ItemStack[9];
-        NBTTagList items = tag.getTagList("Items", 10);
+        boolean[] occupied = new boolean[9];
+        NBTTagList items = StrictNbt.list(tag, "Items", 10);
         for (int i = 0; i < items.tagCount(); i++) {
             NBTTagCompound item = items.getCompoundTagAt(i);
+            StrictNbt.require(item, "Slot", 1);
             int slot = item.getByte("Slot") & 255;
-            if (slot < inventory.length) inventory[slot] = ItemStack.loadItemStackFromNBT(item);
+            if (slot >= inventory.length || occupied[slot])
+                throw new IllegalStateException("Invalid or duplicate shelf slot " + slot);
+            occupied[slot] = true;
+            StrictNbt.require(item, "id", 2);
+            StrictNbt.require(item, "Count", 1);
+            StrictNbt.require(item, "Damage", 2);
+            if (item.getByte("Count") <= 0) throw new IllegalStateException("Non-positive item count in slot " + slot);
+            inventory[slot] = ItemStack.loadItemStackFromNBT(item);
+            if (inventory[slot] == null || inventory[slot].stackSize <= 0)
+                throw new IllegalStateException("Invalid item stack in slot " + slot);
         }
         ShelfRecord record = new ShelfRecord(
             new UUID(tag.getLong("UuidMost"), tag.getLong("UuidLeast")),
             ShelfLocation.read(tag.getCompoundTag("Location")),
             tag.getString("CustomName"),
-            tag.getLong("Order"),
+            StrictNbt.nonnegativeLong(tag, "Order"),
             inventory);
-        record.version = tag.getLong("Version");
-        if (tag.hasKey("State")) {
-            try {
-                record.state = State.valueOf(tag.getString("State"));
-            } catch (IllegalArgumentException exception) {
-                throw new IllegalStateException(
-                    "Invalid shelf transaction state: " + tag.getString("State"),
-                    exception);
-            }
+        record.version = StrictNbt.nonnegativeLong(tag, "Version");
+        try {
+            record.state = State.valueOf(tag.getString("State"));
+        } catch (IllegalArgumentException exception) {
+            throw new IllegalStateException("Invalid shelf transaction state: " + tag.getString("State"), exception);
         }
         record.writebackPending = tag.getBoolean("WritebackPending");
-        if (tag.hasKey("RemovalTransactionMost") && tag.hasKey("RemovalTransactionLeast"))
+        if (StrictNbt.optionalPair(tag, "RemovalTransactionMost", "RemovalTransactionLeast", 4))
             record.removalTransaction = new UUID(
                 tag.getLong("RemovalTransactionMost"),
                 tag.getLong("RemovalTransactionLeast"));
+        if (tag.hasKey("RemovalDropsStarted")) StrictNbt.require(tag, "RemovalDropsStarted", 1);
+        if (tag.hasKey("RemovalSourceVersion")) StrictNbt.require(tag, "RemovalSourceVersion", 4);
         record.removalDropsStarted = tag.getBoolean("RemovalDropsStarted");
         record.removalSourceVersion = tag.getLong("RemovalSourceVersion");
         if (record.state != State.ACTIVE && record.removalTransaction == null)
             throw new IllegalStateException("Prepared shelf removal has no transaction identity");
+        if (record.state != State.ACTIVE && (!tag.hasKey("RemovalDropsStarted") || !tag.hasKey("RemovalSourceVersion")
+            || record.removalSourceVersion < 0))
+            throw new IllegalStateException("Incomplete prepared shelf removal metadata");
+        if (record.state == State.ACTIVE && record.removalTransaction != null)
+            throw new IllegalStateException("Active shelf contains removal metadata");
+        if (record.state == State.ACTIVE && (record.removalDropsStarted || record.removalSourceVersion != 0))
+            throw new IllegalStateException("Active shelf contains removal state");
         return record;
     }
 
