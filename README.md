@@ -1,37 +1,33 @@
-# Witchery Optimizer
+# Witchery Optimizer 0.3.0
 
-Witchery Optimizer 0.2.4 is a **server-side-only** mod for Witchery 0.24.1 on Minecraft 1.7.10. It replaces permanent Poppet Shelf chunk tickets with authoritative, UUID-indexed `WorldSavedData`; clients do not need the mod.
+A server-only mod for GTNH 2.8.4, Minecraft 1.7.10, Forge 10.13.4.1614, and Witchery 0.24.1.
 
-## Safety and compatibility
+## Architecture
 
-- Stores complete nine-slot inventories, custom names, locations, stable observed order, versions and shelf UUIDs.
-- Performs synchronous startup validation only for existing authoritative records, loading each record's exact chunk through registered dimensions and mirroring authority only to a Shelf with the exact persistent UUID. Unregistered or unavailable dimensions, unverifiable or failed disk loads, and mismatches in preloaded chunks remain fail-closed for retry. A missing block, TE, or UUID is durably tombstoned only after this validation has positively proved that the original persisted chunk was read. There is no full-world or region census; never-indexed shelves may remain absent until a ticket callback or natural TE attach imports them.
-- Ticket restoration is only a one-time drain/bootstrap hint: every restored ticket independently attempts import and release, is never retained or reacquired, and anomalies become persisted diagnostics rather than permanent blockers. Startup authority-validation proof enables lookup.
-- Corrupt persistence or failed WAL writes keep initialization and lookup fail-closed. The v0.2.4 validation marker is distinct from v0.2.3 census completion.
-- Server logs report initialization, ticket drain, authority-validation counts/deletions, and pending writebacks without per-tick spam.
-- Lookup preserves Witchery parity: player inventory and hunter-clothes behavior remain original; loaded shelves follow the exact `MinecraftServer.worldServers` array and each live `loadedTileEntityList` iterator order and use Witchery's private matcher. Sleeping worlds extend the persisted dimension order, with newly discovered dimensions appended numerically; records retain observation order.
-- Dimension restriction keeps Witchery's numeric allowance: Overworld (0), Nether (-1), End (1), and configured Dream dimension. No personal dimension IDs are hardcoded.
-- Generic NBT movers are deliberately unsupported. A UUID copied to another location is quarantined and its carried inventory is **not imported**; the authoritative source remains usable. Intentional player placement receives a new identity. This fail-closed policy avoids guessing move versus clone and guarantees no copied authoritative inventory.
-- Shelf removal uses at-most-once semantics: an immutable authoritative snapshot is taken and the authority is durably WAL-tombstoned before Witchery can emit an inventory entity. Witchery's original `breakBlock` then reads that snapshot and retains its original slot iteration, stack splitting, randomization, entity construction/spawn, block-item behavior, and side effects. Spawned entities are immediately vanilla-owned. A crash after deletion may lose items but can never replay or duplicate them. Legacy interrupted removal records are tombstoned without drops at startup.
-- Rejected cloned, conflicting, or tombstoned physical shelves remain removable through an exact cleanup context: Witchery keeps its normal block-removal behavior, but inventory slot reads return empty so unauthorized copied contents cannot drop. Legitimate authority elsewhere is untouched.
-- Loaded shelves always serialize ordinary Witchery `Items`/`CustomName` NBT plus UUID. Unloaded consumption marks durable pending writeback; natural chunk load mirrors authoritative state and marks the chunk dirty; serialization embeds `WOWritebackVersion`, but pending clears only after a later natural region reload proves that exact authoritative version reached disk. Startup/shutdown logs report the exact pending count. Stale physical NBT cannot become authoritative while installed.
+WorldSavedData plus its fsynced write-ahead log is the sole logical Poppet Shelf inventory. Witchery tile entities are ordinary-NBT IO mirrors. Mutations and consumption commit WAL-first. Witchery's original inventory matcher operates on authoritative nine-slot adapters, preserving matching, consumption, and shelf order.
 
-Clean uninstall is safe only when logs show no pending writeback and logs report zero pending writebacks after every changed shelf-owning chunk has saved, unloaded, and naturally reloaded to confirm the disk version. Keep a backup; uninstalling while pending mirrors exist can expose stale Witchery NBT.
+The replacement Witchery ordered ticket callback strictly validates `poppetX/Y/Z`, synchronously loads and verifies the exact block and TE, and retains only processable tickets. Its ordinary callback imports physical inventory into a new authority WAL-first, assigns identity, mirrors and marks dirty, then releases every retained live ticket. Lookups open after successful storage initialization on the first END tick. Later world callbacks remain synchronous. No scan, hardcoded dimension, or persistent completion gate exists.
 
-Schema validation is strict. Missing schema, Schema 1, and schema-1 journal data produce an explicit unsupported-v0.1 startup failure and are never migrated, reset, or overwritten. A pure Witchery world with no optimizer data remains supported.
+Loaded consumption commits authority, immediately mirrors, and marks dirty without a queue or ticket. Unloaded consumption persists `WritebackPending`. Up to eight independent NORMAL optimizer tickets use depth one and force one exact chunk. Expiry is checked on main-thread safe opportunities using both monotonic five seconds and a 100-tick cap. Under server lag, wall time can exceed five seconds because release occurs on the next server tick. Completion, expiry, disappearance, world unload, and server stop explicitly unforce/release. Restored optimizer tickets are rejected before becoming live; pending authority flags reconstruct jobs.
 
-`TileEntity.onChunkUnload()V` is Forge-added and remains unobfuscated in production: the mixin target intentionally has `remap=false`. It has no SRG mapping; `remap=true` is invalid and rejected by the annotation processor. The required mixin configuration remains safe because the explicit descriptor is validated in the production artifact.
+## Crash, removal, and compatibility
+
+Authority consumption remains final if physical synchronization fails; a durable repair is queued. A crash after TE mirror acknowledgement but before chunk save may leave older physical NBT, but authority overwrites it on the next load, so no logical duplication occurs. If WAL-first shelf creation survives a crash before its TE identity saves, the identity-less TE at that exact location is assigned the existing authority UUID and overwritten from authority; its physical contents are never imported. Shelf replacement is intercepted before World mutation: authority is WAL-tombstoned before Witchery's original break/drop routine runs against the authoritative mirror. A WAL failure cancels the entire block change. Snapshot-captured block placement and multi-place operations cannot replace a Poppet Shelf, avoiding irreversible drops or tombstones before Forge resolves placement cancellation. Snapshot restoration never tombstones an authority. Copied identity at another location is emptied and never imported.
+
+Removing the mod leaves the most recently saved ordinary Witchery `Items` and `CustomName`. An acknowledged mirror not yet saved at a crash may be older. No client installation is required.
 
 ## Building
 
-Place `witchery-1.7.10-0.24.1.jar` in `libs/`, use the project JDK 25, and run:
+Use the repository-local toolchain:
 
 ```text
-gradlew.bat spotlessCheck check build validateProductionJar
+GRADLE_USER_HOME=.gradle-user-home
+JAVA_HOME=.jdk\jdk-25.0.4+7
+gradlew.bat clean spotlessCheck checkstyleMain checkstyleTest test build validateProductionJar --rerun-tasks --no-daemon --no-configuration-cache --console=plain
 ```
 
-The wrapper uses the repository-local `.gradle-user-home`. `validateProductionJar` checks the reobfuscated JAR manifest, mixin config/refmap/classes and the exact unobfuscated `onChunkUnload()V` target.
+Output targets Java 8 bytecode.
 
 ## License
 
-GNU GPL v3.0. See [LICENSE](LICENSE).
+GNU General Public License v3.0. See `LICENSE`.

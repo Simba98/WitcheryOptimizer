@@ -5,13 +5,13 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.LinkedHashMap;
-import java.util.Map;
 import java.util.UUID;
 
 import net.minecraft.nbt.CompressedStreamTools;
@@ -21,10 +21,8 @@ import net.minecraft.world.WorldServer;
 
 final class ShelfJournal {
 
-    private static final String FILE_NAME = "witcheryoptimizer-journal.dat";
-    private final File file;
-    private final File temporary;
-    private final File directory;
+    private static final String FILE = "witcheryoptimizer-v3-wal.dat";
+    private final File file, temporary, directory;
     private NBTTagCompound root;
 
     ShelfJournal(WorldServer world) throws IOException {
@@ -33,172 +31,32 @@ final class ShelfJournal {
                 .getWorldDirectory());
     }
 
-    private static void validateRoot(NBTTagCompound value) throws IOException {
-        if (value == null) return;
-        try {
-            StrictNbt.require(value, "Schema", 3);
-            if (value.getInteger("Schema") != PoppetWorldData.SCHEMA)
-                throw new IllegalStateException("Unsupported journal schema");
-            StrictNbt.nonnegativeLong(value, "Sequence");
-            NBTTagList operations = StrictNbt.list(value, "Entries", 10);
-            Map<UUID, Boolean> identities = new LinkedHashMap<>();
-            for (int index = 0; index < operations.tagCount(); index++) {
-                NBTTagCompound operation = operations.getCompoundTagAt(index);
-                StrictNbt.require(operation, "Kind", 8);
-                String kind = operation.getString("Kind");
-                UUID identity;
-                if ("PUT".equals(kind)) {
-                    StrictNbt.require(operation, "Record", 10);
-                    identity = ShelfRecord.read(operation.getCompoundTag("Record")).id;
-                } else if ("DELETE".equals(kind)) {
-                    StrictNbt.require(operation, "ShelfMost", 4);
-                    StrictNbt.require(operation, "ShelfLeast", 4);
-                    StrictNbt.nonnegativeLong(operation, "Generation");
-                    if (operation.hasKey("Location")) {
-                        StrictNbt.require(operation, "Location", 10);
-                        ShelfLocation.read(operation.getCompoundTag("Location"));
-                    }
-                    StrictNbt.optionalPair(operation, "RemovalMost", "RemovalLeast", 4);
-                    identity = uuid(operation, "Shelf");
-                } else throw new IllegalStateException("Invalid journal operation kind " + kind);
-                if (identities.put(identity, Boolean.TRUE) != null)
-                    throw new IllegalStateException("Duplicate journal shelf operation " + identity);
-            }
-            if (value.hasKey("ImportState")) {
-                StrictNbt.require(value, "ImportState", 8);
-                PoppetWorldData.ImportState.valueOf(value.getString("ImportState"));
-            }
-            if (value.hasKey("CensusState") != value.hasKey("CensusVersion"))
-                throw new IllegalStateException("Partial validation metadata");
-            if (value.hasKey("CensusState")) {
-                StrictNbt.require(value, "CensusState", 8);
-                PoppetWorldData.CensusState state = PoppetWorldData.CensusState.valueOf(value.getString("CensusState"));
-                StrictNbt.nonnegativeInt(value, "CensusVersion");
-                if (state == PoppetWorldData.CensusState.RETRY_WAIT) {
-                    if (StrictNbt.nonnegativeInt(value, "CensusRetryAttempt") == 0)
-                        throw new IllegalStateException("Zero retry attempt");
-                    StrictNbt.nonnegativeLong(value, "CensusRetryAt");
-                    StrictNbt.require(value, "CensusRetryCorruption", 1);
-                    StrictNbt.require(value, "CensusRetryReason", 8);
-                }
-            }
-        } catch (RuntimeException exception) {
-            throw new IOException("Invalid optimizer journal root", exception);
-        }
-    }
-
     ShelfJournal(File directory) throws IOException {
         this.directory = directory;
-        file = new File(directory, FILE_NAME);
-        temporary = new File(directory, FILE_NAME + ".tmp");
-        root = loadNewest();
+        file = new File(directory, FILE);
+        temporary = new File(directory, FILE + ".tmp");
+        root = load();
     }
 
     void recover(PoppetWorldData data) throws IOException {
-        NBTTagList operations = root.getTagList("Entries", 10);
-        for (int i = 0; i < operations.tagCount(); i++) data.applyJournal(operations.getCompoundTagAt(i));
-        if (operations.tagCount() > 0) data.markDirty();
-        if (root.hasKey("ImportState")) try {
-            data.setImportState(PoppetWorldData.ImportState.valueOf(root.getString("ImportState")));
-        } catch (IllegalArgumentException exception) {
-            throw new IOException("Invalid journal ImportState=" + root.getString("ImportState"), exception);
-        }
-        if (root.hasKey("CensusState")) try {
-            data.setCensusState(
-                root.getInteger("CensusVersion"),
-                PoppetWorldData.CensusState.valueOf(root.getString("CensusState")));
-        } catch (IllegalArgumentException exception) {
-            throw new IOException("Invalid journal CensusState=" + root.getString("CensusState"), exception);
-        }
-        if (root.getString("CensusState")
-            .equals(PoppetWorldData.CensusState.RETRY_WAIT.name()))
-            data.setCensusRetry(
-                root.getInteger("CensusVersion"),
-                root.getInteger("CensusRetryAttempt"),
-                root.getLong("CensusRetryAt"),
-                root.getBoolean("CensusRetryCorruption"),
-                root.getString("CensusRetryReason"));
-    }
-
-    void appendImportState(PoppetWorldData.ImportState state) throws IOException {
-        NBTTagCompound next = (NBTTagCompound) root.copy();
-        next.setString("ImportState", state.name());
-        next.setLong("Sequence", root.getLong("Sequence") + 1);
-        writeAndReplace(next, temporary, file);
-        root = next;
-    }
-
-    void appendCensusState(int version, PoppetWorldData.CensusState state) throws IOException {
-        NBTTagCompound next = (NBTTagCompound) root.copy();
-        next.setInteger("CensusVersion", version);
-        next.setString("CensusState", state.name());
-        if (state == PoppetWorldData.CensusState.COMPLETE) {
-            next.removeTag("CensusRetryAttempt");
-            next.removeTag("CensusRetryAt");
-            next.removeTag("CensusRetryCorruption");
-            next.removeTag("CensusRetryReason");
-        }
-        next.setLong("Sequence", root.getLong("Sequence") + 1);
-        writeAndReplace(next, temporary, file);
-        root = next;
-    }
-
-    void appendCensusRetry(int version, int attempt, long at, boolean corruption, String reason) throws IOException {
-        NBTTagCompound next = (NBTTagCompound) root.copy();
-        next.setInteger("CensusVersion", version);
-        next.setString("CensusState", PoppetWorldData.CensusState.RETRY_WAIT.name());
-        next.setInteger("CensusRetryAttempt", attempt);
-        next.setLong("CensusRetryAt", at);
-        next.setBoolean("CensusRetryCorruption", corruption);
-        next.setString("CensusRetryReason", reason);
-        next.setLong("Sequence", root.getLong("Sequence") + 1);
-        writeAndReplace(next, temporary, file);
-        root = next;
+        NBTTagList entries = StrictNbt.list(root, "Entries", 10);
+        for (int i = 0; i < entries.tagCount(); i++) data.applyJournal(entries.getCompoundTagAt(i));
     }
 
     void appendPost(ShelfRecord record) throws IOException {
-        NBTTagCompound operation = new NBTTagCompound();
-        operation.setString("Kind", "PUT");
-        operation.setTag("Record", record.write());
-        replaceEntry(record.id, operation);
+        NBTTagCompound op = new NBTTagCompound();
+        op.setString("Kind", "PUT");
+        op.setTag("Record", record.write());
+        replace(record.id, op);
     }
 
-    void appendDelete(ShelfRecord record, long generation) throws IOException {
-        NBTTagCompound operation = new NBTTagCompound();
-        operation.setString("Kind", "DELETE");
-        putUuid(operation, "Shelf", record.id);
-        operation.setLong("Generation", generation);
-        operation.setTag("Location", record.location.write());
-        if (record.removalTransaction != null) {
-            operation.setLong("RemovalMost", record.removalTransaction.getMostSignificantBits());
-            operation.setLong("RemovalLeast", record.removalTransaction.getLeastSignificantBits());
-        }
-        replaceEntry(record.id, operation);
-    }
-
-    private void replaceEntry(UUID shelf, NBTTagCompound operation) throws IOException {
-        Map<UUID, NBTTagCompound> compacted = entries((NBTTagCompound) root.copy());
-        compacted.put(shelf, (NBTTagCompound) operation.copy());
-        NBTTagCompound next = new NBTTagCompound();
-        next.setInteger("Schema", PoppetWorldData.SCHEMA);
-        NBTTagList list = new NBTTagList();
-        for (NBTTagCompound entry : compacted.values()) list.appendTag(entry);
-        next.setTag("Entries", list);
-        if (root.hasKey("ImportState")) next.setString("ImportState", root.getString("ImportState"));
-        if (root.hasKey("CensusState")) {
-            next.setInteger("CensusVersion", root.getInteger("CensusVersion"));
-            next.setString("CensusState", root.getString("CensusState"));
-            if (root.getString("CensusState")
-                .equals(PoppetWorldData.CensusState.RETRY_WAIT.name())) {
-                next.setInteger("CensusRetryAttempt", root.getInteger("CensusRetryAttempt"));
-                next.setLong("CensusRetryAt", root.getLong("CensusRetryAt"));
-                next.setBoolean("CensusRetryCorruption", root.getBoolean("CensusRetryCorruption"));
-                next.setString("CensusRetryReason", root.getString("CensusRetryReason"));
-            }
-        }
-        next.setLong("Sequence", root.getLong("Sequence") + 1);
-        writeAndReplace(next, temporary, file);
-        root = next;
+    void appendDelete(ShelfRecord record) throws IOException {
+        NBTTagCompound op = new NBTTagCompound();
+        op.setString("Kind", "DELETE");
+        op.setLong("ShelfMost", record.id.getMostSignificantBits());
+        op.setLong("ShelfLeast", record.id.getLeastSignificantBits());
+        op.setLong("Generation", record.version + 1);
+        replace(record.id, op);
     }
 
     int entryCount() {
@@ -206,102 +64,118 @@ final class ShelfJournal {
             .tagCount();
     }
 
-    private static Map<UUID, NBTTagCompound> entries(NBTTagCompound value) {
-        Map<UUID, NBTTagCompound> result = new LinkedHashMap<>();
-        NBTTagList list = value.getTagList("Entries", 10);
-        for (int i = 0; i < list.tagCount(); i++) {
-            NBTTagCompound entry = list.getCompoundTagAt(i);
-            UUID id = "DELETE".equals(entry.getString("Kind")) ? uuid(entry, "Shelf")
-                : uuid(entry.getCompoundTag("Record"), "Uuid");
-            result.put(id, entry);
+    private void replace(UUID id, NBTTagCompound operation) throws IOException {
+        LinkedHashMap<UUID, NBTTagCompound> map = new LinkedHashMap<>();
+        NBTTagList old = StrictNbt.list(root, "Entries", 10);
+        for (int i = 0; i < old.tagCount(); i++) {
+            NBTTagCompound e = old.getCompoundTagAt(i);
+            UUID k = identity(e);
+            map.put(k, e);
         }
-        return result;
+        map.put(id, operation);
+        NBTTagCompound next = new NBTTagCompound();
+        next.setInteger("Schema", PoppetWorldData.SCHEMA);
+        next.setLong("Sequence", root.getLong("Sequence") + 1);
+        NBTTagList list = new NBTTagList();
+        for (NBTTagCompound e : map.values()) list.appendTag(e);
+        next.setTag("Entries", list);
+        write(next);
+        root = next;
     }
 
-    private NBTTagCompound loadNewest() throws IOException {
-        NBTTagCompound main = validRead(file);
-        NBTTagCompound temp = validRead(temporary);
-        if (main == null && temp == null) {
-            if (file.exists() || temporary.exists()) throw new IOException("No valid optimizer journal copy exists");
-            NBTTagCompound fresh = new NBTTagCompound();
-            fresh.setInteger("Schema", PoppetWorldData.SCHEMA);
-            fresh.setLong("Sequence", 0);
-            fresh.setTag("Entries", new NBTTagList());
-            return fresh;
+    private NBTTagCompound load() throws IOException {
+        NBTTagCompound a = readValid(file), b = readValid(temporary);
+        if (a == null && b == null) {
+            if (file.exists() || temporary.exists()) throw new IOException("No valid v3 WAL copy");
+            NBTTagCompound n = new NBTTagCompound();
+            n.setInteger("Schema", PoppetWorldData.SCHEMA);
+            n.setLong("Sequence", 0);
+            n.setTag("Entries", new NBTTagList());
+            return n;
         }
-        validateRoot(main);
-        validateRoot(temp);
-        if (temp != null && (main == null || temp.getLong("Sequence") > main.getLong("Sequence"))) {
-            replace(temporary.toPath(), file.toPath());
-            forceDirectory();
-            return temp;
-        }
-        if (temporary.exists() && !temporary.delete())
-            throw new IOException("Unable to remove stale journal temp file");
-        return main;
+        NBTTagCompound n = b != null && (a == null || b.getLong("Sequence") > a.getLong("Sequence")) ? b : a;
+        validate(n);
+        if (n == b) move(temporary.toPath(), file.toPath());
+        else if (temporary.exists() && !temporary.delete()) throw new IOException("Cannot remove stale WAL temp");
+        return n;
     }
 
-    private static NBTTagCompound validRead(File source) {
-        if (!source.isFile()) return null;
-        try {
-            return read(source);
-        } catch (IOException | RuntimeException ignored) {
+    private static NBTTagCompound readValid(File f) {
+        if (!f.isFile()) return null;
+        try (FileInputStream in = new FileInputStream(f)) {
+            return CompressedStreamTools.readCompressed(in);
+        } catch (Exception e) {
             return null;
         }
     }
 
-    private static NBTTagCompound read(File source) throws IOException {
-        try (FileInputStream input = new FileInputStream(source)) {
-            NBTTagCompound result = CompressedStreamTools.readCompressed(input);
-            if (result == null) throw new IOException("Empty optimizer journal " + source);
-            return result;
-        }
-    }
-
-    private void writeAndReplace(NBTTagCompound value, File temp, File destination) throws IOException {
-        try (FileOutputStream output = new FileOutputStream(temp)) {
-            CompressedStreamTools.writeCompressed(value, new NonClosingOutputStream(output));
-            output.getFD()
-                .sync();
-        }
-        replace(temp.toPath(), destination.toPath());
-        forceDirectory();
-    }
-
-    private static void replace(Path source, Path destination) throws IOException {
+    private static void validate(NBTTagCompound n) throws IOException {
         try {
-            Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        } catch (AtomicMoveNotSupportedException exception) {
-            Files.move(source, destination, StandardCopyOption.REPLACE_EXISTING);
+            StrictNbt.require(n, "Schema", 3);
+            if (n.getInteger("Schema") != PoppetWorldData.SCHEMA) throw new IllegalStateException("Wrong WAL schema");
+            StrictNbt.nonnegativeLong(n, "Sequence");
+            NBTTagList l = StrictNbt.list(n, "Entries", 10);
+            LinkedHashMap<UUID, Boolean> identities = new LinkedHashMap<>();
+            for (int i = 0; i < l.tagCount(); i++) {
+                NBTTagCompound e = l.getCompoundTagAt(i);
+                StrictNbt.require(e, "Kind", 8);
+                if ("PUT".equals(e.getString("Kind"))) {
+                    StrictNbt.require(e, "Record", 10);
+                    ShelfRecord.read(e.getCompoundTag("Record"));
+                } else if ("DELETE".equals(e.getString("Kind"))) {
+                    StrictNbt.require(e, "ShelfMost", 4);
+                    StrictNbt.require(e, "ShelfLeast", 4);
+                    StrictNbt.nonnegativeLong(e, "Generation");
+                } else throw new IllegalStateException("Bad WAL kind");
+                UUID id = identity(e);
+                if (identities.put(id, Boolean.TRUE) != null)
+                    throw new IllegalStateException("Duplicate WAL operation for " + id);
+            }
+        } catch (RuntimeException x) {
+            throw new IOException("Invalid v3 WAL", x);
         }
     }
 
-    private void forceDirectory() throws IOException {
-        try (FileChannel channel = FileChannel.open(directory.toPath(), StandardOpenOption.READ)) {
-            channel.force(true);
-        } catch (java.nio.file.AccessDeniedException | UnsupportedOperationException ignored) {
-            // Windows and some file systems do not permit opening directories; the file itself was fsynced.
+    private static UUID identity(NBTTagCompound operation) {
+        if ("PUT".equals(operation.getString("Kind"))) {
+            StrictNbt.require(operation, "Record", 10);
+            NBTTagCompound record = operation.getCompoundTag("Record");
+            StrictNbt.require(record, "UuidMost", 4);
+            StrictNbt.require(record, "UuidLeast", 4);
+            return new UUID(record.getLong("UuidMost"), record.getLong("UuidLeast"));
+        }
+        StrictNbt.require(operation, "ShelfMost", 4);
+        StrictNbt.require(operation, "ShelfLeast", 4);
+        return new UUID(operation.getLong("ShelfMost"), operation.getLong("ShelfLeast"));
+    }
+
+    private void write(NBTTagCompound n) throws IOException {
+        try (FileOutputStream out = new FileOutputStream(temporary)) {
+            CompressedStreamTools.writeCompressed(n, out);
+            sync(out);
+        }
+        move(temporary.toPath(), file.toPath());
+        try (FileChannel c = FileChannel.open(directory.toPath(), StandardOpenOption.READ)) {
+            c.force(true);
+        } catch (AccessDeniedException | UnsupportedOperationException ignored) {
+            // Some file systems cannot open directories; the WAL file itself was fsynced.
         }
     }
 
-    private static UUID uuid(NBTTagCompound tag, String prefix) {
-        return new UUID(tag.getLong(prefix + "Most"), tag.getLong(prefix + "Least"));
-    }
-
-    private static void putUuid(NBTTagCompound tag, String prefix, UUID id) {
-        tag.setLong(prefix + "Most", id.getMostSignificantBits());
-        tag.setLong(prefix + "Least", id.getLeastSignificantBits());
-    }
-
-    private static final class NonClosingOutputStream extends java.io.FilterOutputStream {
-
-        NonClosingOutputStream(FileOutputStream output) {
-            super(output);
+    private static void sync(FileOutputStream out) throws IOException {
+        try {
+            out.getFD()
+                .sync();
+        } catch (java.io.SyncFailedException exception) {
+            if (!Boolean.getBoolean("witcheryoptimizer.allowUnsupportedFsync")) throw exception;
         }
+    }
 
-        @Override
-        public void close() throws IOException {
-            flush();
+    private static void move(Path a, Path b) throws IOException {
+        try {
+            Files.move(a, b, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(a, b, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 }

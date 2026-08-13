@@ -7,9 +7,6 @@
   "compatibilityLevel": "JAVA_8",
   "mixins": [
     "ItemPoppetInvoker",
-    "MixinBlockPoppetShelf",
-    "MixinChunk",
-    "MixinChunkProviderServer",
     "MixinItemPoppet",
     "MixinPoppetShelf",
     "MixinTileEntity",

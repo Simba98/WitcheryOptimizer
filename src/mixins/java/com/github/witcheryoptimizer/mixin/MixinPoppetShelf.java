@@ -26,57 +26,35 @@ public abstract class MixinPoppetShelf implements PoppetShelfState {
 
     @Shadow
     private Ticket chunkTicket;
-
     @Shadow
     protected String customName;
-
     @Unique
     private UUID witcheryoptimizer$shelfId;
-
     @Unique
-    private boolean witcheryoptimizer$persistentShelfId;
+    private boolean witcheryoptimizer$persistent;
 
-    @Unique
-    private long witcheryoptimizer$diskMirrorVersion = -1;
-
-    @Override
     public UUID witcheryoptimizer$getShelfId() {
         return witcheryoptimizer$shelfId;
     }
 
-    @Override
     public void witcheryoptimizer$setShelfId(UUID id) {
         witcheryoptimizer$shelfId = id;
     }
 
-    @Override
     public boolean witcheryoptimizer$hasPersistentShelfId() {
-        return witcheryoptimizer$persistentShelfId;
+        return witcheryoptimizer$persistent;
     }
 
-    @Override
-    public void witcheryoptimizer$setPersistentShelfId(boolean persistent) {
-        witcheryoptimizer$persistentShelfId = persistent;
+    public void witcheryoptimizer$setPersistentShelfId(boolean v) {
+        witcheryoptimizer$persistent = v;
     }
 
-    @Override
-    public long witcheryoptimizer$getDiskMirrorVersion() {
-        return witcheryoptimizer$diskMirrorVersion;
-    }
-
-    @Override
-    public void witcheryoptimizer$setDiskMirrorVersion(long version) {
-        witcheryoptimizer$diskMirrorVersion = version;
-    }
-
-    @Override
     public String witcheryoptimizer$getCustomName() {
         return customName == null ? "" : customName;
     }
 
-    @Override
-    public void witcheryoptimizer$setCustomName(String name) {
-        customName = name == null || name.isEmpty() ? null : name;
+    public void witcheryoptimizer$setCustomName(String n) {
+        customName = n == null || n.isEmpty() ? null : n;
     }
 
     @Redirect(
@@ -85,69 +63,62 @@ public abstract class MixinPoppetShelf implements PoppetShelfState {
             value = "INVOKE",
             target = "Lnet/minecraftforge/common/ForgeChunkManager;requestTicket(Ljava/lang/Object;Lnet/minecraft/world/World;Lnet/minecraftforge/common/ForgeChunkManager$Type;)Lnet/minecraftforge/common/ForgeChunkManager$Ticket;"),
         remap = false)
-    private Ticket witcheryoptimizer$disablePermanentTicket(Object mod, World world, ForgeChunkManager.Type type) {
+    private Ticket wo$noPermanent(Object m, World w, ForgeChunkManager.Type t) {
         return null;
     }
 
     @Inject(method = "initiate", at = @At("RETURN"), remap = false)
-    private void witcheryoptimizer$attached(CallbackInfo ci) {
+    private void wo$attach(CallbackInfo c) {
         PoppetRegistry.instance()
             .attach((TileEntityPoppetShelf) (Object) this);
     }
 
     @Inject(method = "forceChunkLoading", at = @At("HEAD"), cancellable = true, remap = false)
-    private void witcheryoptimizer$migrateTicket(Ticket ticket, CallbackInfo ci) {
-        if (PoppetRegistry.instance()
-            .releaseWitcheryTicket((TileEntityPoppetShelf) (Object) this, ticket)) {
-            chunkTicket = null;
-            ci.cancel();
-        }
+    private void wo$release(Ticket t, CallbackInfo c) {
+        if (t != null) ForgeChunkManager.releaseTicket(t);
+        chunkTicket = null;
+        c.cancel();
     }
 
     @Inject(method = "readFromNBT", at = @At("RETURN"), remap = true)
-    private void witcheryoptimizer$readId(NBTTagCompound tag, CallbackInfo ci) {
-        witcheryoptimizer$diskMirrorVersion = tag.hasKey("WOWritebackVersion") ? tag.getLong("WOWritebackVersion") : -1;
-        if (tag.hasKey("WOShelfUuidMost") && tag.hasKey("WOShelfUuidLeast")) {
-            witcheryoptimizer$shelfId = new UUID(tag.getLong("WOShelfUuidMost"), tag.getLong("WOShelfUuidLeast"));
-            witcheryoptimizer$persistentShelfId = true;
-        } else {
-            witcheryoptimizer$shelfId = UUID.randomUUID();
-            witcheryoptimizer$persistentShelfId = false;
+    private void wo$read(NBTTagCompound n, CallbackInfo c) {
+        if (n.hasKey("WOShelfUuidMost", 4) && n.hasKey("WOShelfUuidLeast", 4)) {
+            witcheryoptimizer$shelfId = new UUID(n.getLong("WOShelfUuidMost"), n.getLong("WOShelfUuidLeast"));
+            witcheryoptimizer$persistent = true;
         }
+        PoppetRegistry.instance()
+            .attach((TileEntityPoppetShelf) (Object) this);
     }
 
     @Inject(method = "writeToNBT", at = @At("HEAD"), remap = true)
-    private void witcheryoptimizer$prepareWrite(NBTTagCompound tag, CallbackInfo ci) {
+    private void wo$writeHead(NBTTagCompound n, CallbackInfo c) {
         PoppetRegistry.instance()
             .prepareWrite((TileEntityPoppetShelf) (Object) this);
-        if (witcheryoptimizer$shelfId == null) witcheryoptimizer$shelfId = UUID.randomUUID();
     }
 
     @Inject(method = "writeToNBT", at = @At("RETURN"), remap = true)
-    private void witcheryoptimizer$writeId(NBTTagCompound tag, CallbackInfo ci) {
+    private void wo$write(NBTTagCompound n, CallbackInfo c) {
         PoppetRegistry.instance()
-            .writeIdentity((TileEntityPoppetShelf) (Object) this, tag);
-        witcheryoptimizer$persistentShelfId = true;
+            .writeIdentity((TileEntityPoppetShelf) (Object) this, n);
+        witcheryoptimizer$persistent = true;
     }
 
     @Inject(method = "markDirty", at = @At("RETURN"), remap = true)
-    private void witcheryoptimizer$inventoryChanged(CallbackInfo ci) {
+    private void wo$dirty(CallbackInfo c) {
         PoppetRegistry.instance()
             .changed((TileEntityPoppetShelf) (Object) this);
     }
 
     @Inject(method = "getStackInSlotOnClosing(I)Lnet/minecraft/item/ItemStack;", at = @At("RETURN"), remap = true)
-    private void witcheryoptimizer$closingChanged(int slot, CallbackInfoReturnable<ItemStack> cir) {
-        if (cir.getReturnValue() != null) ((TileEntityPoppetShelf) (Object) this).markDirty();
+    private void wo$close(int s, CallbackInfoReturnable<ItemStack> c) {
+        if (c.getReturnValue() != null) ((TileEntityPoppetShelf) (Object) this).markDirty();
     }
 
     @Inject(method = "invalidate", at = @At("HEAD"), remap = true)
-    private void witcheryoptimizer$invalidate(CallbackInfo ci) {
+    private void wo$invalid(CallbackInfo c) {
         witcheryoptimizer$detach();
     }
 
-    @Unique
-    @Override
     public void witcheryoptimizer$detach() {
         PoppetRegistry.instance()
             .detach((TileEntityPoppetShelf) (Object) this);

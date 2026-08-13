@@ -1,10 +1,12 @@
 package com.github.witcheryoptimizer;
 
+import net.minecraftforge.common.ForgeChunkManager;
 import net.minecraftforge.common.MinecraftForge;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import com.github.witcheryoptimizer.migration.OptimizerTicketCallback;
 import com.github.witcheryoptimizer.registry.PoppetRegistry;
 
 import cpw.mods.fml.common.FMLCommonHandler;
@@ -23,21 +25,21 @@ public final class WitcheryOptimizer {
 
     public static final String MODID = "witcheryoptimizer";
     public static final Logger LOG = LogManager.getLogger(MODID);
-
     @Mod.Instance(MODID)
     public static WitcheryOptimizer instance;
 
     @Mod.EventHandler
     public void init(FMLInitializationEvent event) {
-        PoppetRegistry registry = PoppetRegistry.instance();
+        ForgeChunkManager.setForcedChunkLoadingCallback(instance, new OptimizerTicketCallback());
+        PoppetRegistry r = PoppetRegistry.instance();
         FMLCommonHandler.instance()
             .bus()
-            .register(registry);
-        MinecraftForge.EVENT_BUS.register(registry);
+            .register(r);
+        MinecraftForge.EVENT_BUS.register(r);
     }
 
     @Mod.EventHandler
-    public void serverStopped(FMLServerStoppedEvent event) {
+    public void stopped(FMLServerStoppedEvent event) {
         PoppetRegistry.instance()
             .reset();
     }

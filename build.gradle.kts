@@ -7,7 +7,7 @@ plugins {
     id("com.gtnewhorizons.gtnhconvention")
 }
 
-version = "0.2.4"
+version = "0.3.0"
 
 val validateProductionJar by tasks.registering {
     group = "verification"
@@ -27,20 +27,8 @@ val validateProductionJar by tasks.registering {
                 ?: error("Mixin config has no refmap")
             check(zip.getEntry(refmap) != null) { "Missing referenced refmap $refmap" }
             val refmapJson = zip.getInputStream(zip.getEntry(refmap)).bufferedReader().readText()
-            check(refmapJson.contains("func_149749_a")) {
-                "Refmap lost BlockPoppetShelf.breakBlock mapping"
-            }
-            check(refmapJson.contains("func_150807_a")) {
-                "Refmap lost Chunk.func_150807_a mapping"
-            }
-            check(refmapJson.contains("func_73239_e")) {
-                "Refmap lost ChunkProviderServer.safeLoadChunk mapping"
-            }
-            check(refmapJson.contains("MixinChunk")) {
-                "Refmap lost MixinChunk mappings"
-            }
-            check(refmapJson.contains("func_70301_a")) {
-                "Refmap lost IInventory.getStackInSlot mapping"
+            check(refmapJson.contains("func_147465_d")) {
+                "Refmap lost World.setBlock mapping"
             }
             check(refmapJson.contains("func_70304_b")) {
                 "Refmap lost IInventory.getStackInSlotOnClosing mapping"
@@ -53,11 +41,10 @@ val validateProductionJar by tasks.registering {
             check(tileMixin.toString(Charsets.ISO_8859_1).contains("onChunkUnload()V")) {
                 "Production MixinTileEntity lost the Forge-added, unobfuscated onChunkUnload()V target"
             }
-            val providerMixin = zip.getInputStream(zip.getEntry(packageName.replace('.', '/') + "/MixinChunkProviderServer.class")).readBytes()
-            check(providerMixin.toString(Charsets.ISO_8859_1).let {
-                it.contains("syncChunkLoad") && it.contains("safeLoadChunk")
-            }) {
-                "Production MixinChunkProviderServer lost a disk-load observation target"
+            listOf("MixinBlockPoppetShelf", "MixinChunk", "MixinChunkProviderServer").forEach {
+                check(zip.getEntry(packageName.replace('.', '/') + "/$it.class") == null) {
+                    "Production jar contains deleted v0.2 mixin $it"
+                }
             }
             val shelfMixin = zip.getInputStream(zip.getEntry(packageName.replace('.', '/') + "/MixinPoppetShelf.class")).readBytes()
             check(shelfMixin.toString(Charsets.ISO_8859_1).let {
@@ -70,4 +57,5 @@ val validateProductionJar by tasks.registering {
 }
 
 tasks.named("check") { dependsOn(validateProductionJar) }
+tasks.named<Test>("test") { systemProperty("witcheryoptimizer.allowUnsupportedFsync", "true") }
 tasks.named<Jar>("sourcesJar") { duplicatesStrategy = DuplicatesStrategy.EXCLUDE }

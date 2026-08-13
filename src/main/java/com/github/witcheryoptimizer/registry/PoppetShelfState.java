@@ -10,11 +10,7 @@ public interface PoppetShelfState {
 
     boolean witcheryoptimizer$hasPersistentShelfId();
 
-    void witcheryoptimizer$setPersistentShelfId(boolean persistent);
-
-    long witcheryoptimizer$getDiskMirrorVersion();
-
-    void witcheryoptimizer$setDiskMirrorVersion(long version);
+    void witcheryoptimizer$setPersistentShelfId(boolean value);
 
     String witcheryoptimizer$getCustomName();
 

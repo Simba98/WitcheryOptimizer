@@ -15,21 +15,18 @@ import com.github.witcheryoptimizer.registry.PoppetRegistry;
 public abstract class MixinWorld {
 
     @Inject(method = "setBlock(IIILnet/minecraft/block/Block;II)Z", at = @At("HEAD"), cancellable = true, remap = true)
-    private void witcheryoptimizer$preRemove(int x, int y, int z, Block replacement, int metadata, int flags,
-        CallbackInfoReturnable<Boolean> cir) {
+    private void witcheryoptimizer$precommitRemoval(int x, int y, int z, Block replacement, int metadata, int flags,
+        CallbackInfoReturnable<Boolean> result) {
         World world = (World) (Object) this;
-        PoppetRegistry registry = PoppetRegistry.instance();
-        if (!world.isRemote && world.getBlock(x, y, z) == Witchery.Blocks.POPPET_SHELF
-            && replacement != Witchery.Blocks.POPPET_SHELF) {
-            if (registry.beginSetBlock(world, x, y, z) == PoppetRegistry.SetBlockRemoval.TRANSIENT_FAILURE)
-                cir.setReturnValue(false);
+        if (world.isRemote || world.getBlock(x, y, z) != Witchery.Blocks.POPPET_SHELF
+            || replacement == Witchery.Blocks.POPPET_SHELF) return;
+        if (PoppetRegistry.denySnapshotReplacement(world.captureBlockSnapshots, world.restoringBlockSnapshots)) {
+            result.setReturnValue(false);
+            return;
         }
-    }
-
-    @Inject(method = "setBlock(IIILnet/minecraft/block/Block;II)Z", at = @At("RETURN"), remap = true)
-    private void witcheryoptimizer$finishRemove(int x, int y, int z, Block replacement, int metadata, int flags,
-        CallbackInfoReturnable<Boolean> cir) {
-        PoppetRegistry.instance()
-            .finishSetBlock((World) (Object) this, x, y, z, cir.getReturnValue());
+        if (PoppetRegistry.prepareOrdinaryReplacement(world.captureBlockSnapshots, world.restoringBlockSnapshots)
+            && !PoppetRegistry.instance()
+                .prepareRemoval(world, x, y, z))
+            result.setReturnValue(false);
     }
 }
